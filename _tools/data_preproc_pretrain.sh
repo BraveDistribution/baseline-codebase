@@ -3,6 +3,10 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="$SCRIPT_DIR/../../.venv_fomo"
 SRC_DIR="$SCRIPT_DIR/../src"
+LOG_FILE="$SCRIPT_DIR/data_preproc_pretrain.log"
+
+# Redirect all output to log file
+exec > "$LOG_FILE" 2>&1
 
 # Check if we are in the correct virtual environment
 if [[ "$VIRTUAL_ENV" != *".venv_fomo"* ]]; then
@@ -24,4 +28,4 @@ fi
 
 # Run the preprocessing script
 echo "Running preprocessing script..."
-python $SRC_DIR/data/fomo-60k/preprocess.py --in_path=~/.cache/huggingface/hub/datasets--FOMO25--FOMO-MRI/snapshots/cd7f40948e99e6c562cacf1c5255305f923480c2/fomo-60k --out_path=~/Projects_kb/data/pretrain_preproc
+python $SRC_DIR/data/fomo-60k/preprocess.py --in_path=data/fomo-60k/preprocess.py --in_path=/home/mg873uh/Projects_kb/data/pretrain --out_path=/home/mg873uh/Projects_kb/data/pretrain_preproc --out_path=/home/mg873uh/Projects_kb/data/pretrain_preproc
