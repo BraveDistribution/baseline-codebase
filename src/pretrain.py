@@ -226,14 +226,15 @@ def main():
 
     # Initialize wandb logging
     wandb.init(
-        project="fomo-pretraining",
+        project="fomo25",
         name=f"{config['experiment']}_version_{config['version']}",
     )
 
     # Create wandb logger for Lightning
     wandb_logger = L.pytorch.loggers.WandbLogger(
-        project="fomo-pretraining",
+        project="fomo25",
         name=f"{config['experiment']}_version_{config['version']}",
+        entity="matejgazda-technical-university-of-kosice",
         log_model=True,
     )
 
@@ -243,6 +244,8 @@ def main():
         filename="{epoch:02d}",
         every_n_epochs=args.checkpoint_every_n_epochs,
         save_last=True,
+        save_top_k=5,
+        monitor="val/loss"
     )
     callbacks = [checkpoint_callback]
 

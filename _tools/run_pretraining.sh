@@ -1,5 +1,12 @@
 #!/bin/bash
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOG_FILE="$SCRIPT_DIR/run_pretraining.log"
+
+exec > "$LOG_FILE" 2>&1
+
+echo cuda_visible_devices: $CUDA_VISIBLE_DEVICES
+
 # Activate environment
 source /home/mg873uh/Projects_kb/.venv_fomo/bin/activate
 
