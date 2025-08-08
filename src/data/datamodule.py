@@ -112,6 +112,23 @@ class PretrainDataModule(pl.LightningDataModule):
             sampler=sampler,
         )
 
+        
+class PretrainDataModulePatientCombined(pl.LightningDataModule):
+    def __init__(
+        self,
+        patch_size: Tuple[int, int, int],
+        batch_size: int,
+        num_workers: int,
+        splits_config: SplitConfig,
+        split_idx: int,
+        train_data_dir: str,
+        train_sampler: Optional[Sampler] = None,
+        val_sampler: Optional[Sampler] = None,
+        composed_train_transforms: Optional[Compose] = None,
+        composed_val_transforms: Optional[Compose] = None,
+    ):    
+        pass
+
 
 def augmentations_include_spatial(augmentations):
     if augmentations is None:
