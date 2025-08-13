@@ -4,7 +4,7 @@ from torch.optim import AdamW
 import copy
 import logging
 
-import lightning as L
+import pytorch_lightning as L
 from yucca.pipeline.preprocessing import YuccaPreprocessor
 from yucca.functional.utils.kwargs import filter_kwargs
 from batchgenerators.utilities.file_and_folder_operations import join

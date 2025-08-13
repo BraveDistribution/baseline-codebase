@@ -2,14 +2,15 @@
 
 import os
 import torch
-import lightning as L
+import pytorch_lightning as pl
 import argparse
 import warnings
 import wandb
-from lightning.pytorch.callbacks import ModelCheckpoint
+from pytorch_lightning.callbacks import ModelCheckpoint
 from batchgenerators.utilities.file_and_folder_operations import (
     maybe_mkdir_p as ensure_dir_exists,
 )
+from pytorch_lightning.loggers import WandbLogger
 
 from models.self_supervised import SelfSupervisedModel
 from augmentations.augmentation_composer import (
@@ -20,6 +21,7 @@ from data.datamodule import PretrainDataModule
 from data.pretrain_split import get_pretrain_split_config
 from yucca.pipeline.configuration.configure_paths import detect_version
 from utils.utils import setup_seed, SimplePathConfig
+import logging
 
 
 def main():
@@ -52,8 +54,9 @@ def main():
     parser.add_argument(
         "--patch_size",
         type=int,
-        default=64,
-        help="The patch size of the 3D patches extracted from the whole volume.",
+        nargs=3, #Khamyl[Added]
+        default=[240, 256, 256],
+        help="Unified shapes of volumes." #Khamyl[Modified]: "The patch size of the 3D patches extracted from the whole volume.",
     )
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
@@ -75,7 +78,7 @@ def main():
 
     parser.add_argument("--limit_val_batches", type=int, default=None)
     parser.add_argument("--limit_train_batches", type=int, default=None)
-    parser.add_argument("--accumulate_grad_batches", type=int, default=1)
+    parser.add_argument("--accumulate_grad_batches", type=int, default=3)
     parser.add_argument("--overfit_batches", type=int, default=0)
     parser.add_argument("--check_val_every_n_epoch", type=int, default=None)
     parser.add_argument(
@@ -84,6 +87,11 @@ def main():
         default=25,
         help="Save a checkpoint every N epochs",
     )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default='default',
+    )
 
     parser.add_argument(
         "--experiment", type=str, default="base_experiment", help="name of experiment"
@@ -91,8 +99,10 @@ def main():
 
     args = parser.parse_args()
 
-    assert args.patch_size % 8 == 0, args.patch_size
-    assert args.mask_patch_size < args.patch_size
+    assert all(x % 8 == 0 for x in args.patch_size), args.patch_size #Khamyl[Modif]: args.patch_size % 8 == 0, args.patch_size
+    assert all(args.mask_patch_size < x for x in args.patch_size), ( #Khamyl[Modif]: assert args.mask_patch_size < args.patch_size
+        f"mask_patch_size ({args.mask_patch_size}) must be less than all patch_size dimensions {args.patch_size}"
+    )
 
     print(f"Using num_workers: {args.num_workers}, num_devices: {args.num_devices}")
     print("ARGS:", args)
@@ -137,7 +147,7 @@ def main():
         # Reproducibility
         "seed": seed,
         # Model parameters
-        "patch_size": (args.patch_size,) * 3,
+        "patch_size": args.patch_size, # Khamyl[Modified]: (args.patch_size,) * 3,
         "mask_patch_size": args.mask_patch_size,
         "mask_ratio": args.mask_ratio,
         "input_channels": 1,
@@ -194,35 +204,106 @@ def main():
     )
     val_transforms = get_val_augmentations()
 
-    data = PretrainDataModule(
-        patch_size=config["patch_size"],
-        batch_size=config["batch_size"],
-        num_workers=config["num_workers"],
-        splits_config=splits_config,
-        split_idx=0,
-        train_data_dir=train_data_dir,
-        composed_train_transforms=train_transforms,
-        composed_val_transforms=val_transforms,
-    )
+    model = None
+    data = None
 
-    # Create model and trainer
-    model = SelfSupervisedModel(
-        model_name=config["model_name"],
-        config=config,
-        epochs=config["epochs"],
-        warmup_epochs=config["warmup_epochs"],
-        learning_rate=config["learning_rate"],
-        optimizer=config["optimizer"],
-        steps_per_epoch=config["steps_per_epoch"],
-        num_classes=config["num_classes"],
-        input_channels=config["input_channels"],
-        patch_size=config["patch_size"],
-        mask_patch_size=config["mask_patch_size"],
-        mask_ratio=config["mask_ratio"],
-        should_compile=config["should_compile"],
-        compile_mode=config["compile_mode"],
-        rec_loss_masked_only=config["rec_loss_masked_only"],
-    )
+    print("-" * 50, "SELECTED CONFIGURATIONS", "-" * 50)
+    print(f"Model type: {args.model}")
+    print(f"Patch size: {config['patch_size']}")
+    print(f"Train_data_dir: {train_data_dir}")
+    print("-" * 130)
+
+    if args.model == 'contrastive':
+        print('CREATING CONTRASTIVE DATA MODULE')
+        data = PretrainDataModule(
+            patch_size=config["patch_size"],
+            batch_size=config["batch_size"],
+            num_workers=config["num_workers"],
+            splits_config=splits_config,
+            split_idx=0,
+            train_data_dir=train_data_dir,
+            composed_train_transforms=None,
+            composed_val_transforms=None,
+            dataset='contrastive',
+            crop=False,
+        )
+    else:
+        data = PretrainDataModule(
+            patch_size=config["patch_size"],
+            batch_size=config["batch_size"],
+            num_workers=config["num_workers"],
+            splits_config=splits_config,
+            split_idx=0,
+            train_data_dir=train_data_dir,
+            composed_train_transforms=train_transforms,
+            composed_val_transforms=val_transforms,
+        )
+
+    if args.model == 'default':
+        model = SelfSupervisedModel(
+            model_name=config["model_name"],
+            config=config,
+            epochs=config["epochs"],
+            warmup_epochs=config["warmup_epochs"],
+            learning_rate=config["learning_rate"],
+            optimizer=config["optimizer"],
+            steps_per_epoch=config["steps_per_epoch"],
+            num_classes=config["num_classes"],
+            input_channels=config["input_channels"],
+            patch_size=config["patch_size"],
+            mask_patch_size=config["mask_patch_size"],
+            mask_ratio=config["mask_ratio"],
+            should_compile=config["should_compile"],
+            compile_mode=config["compile_mode"],
+            rec_loss_masked_only=config["rec_loss_masked_only"],
+        )
+
+    if args.model == 'contrastive':
+        from models_custom.models import SwinUNETRPretraining
+        model = SwinUNETRPretraining(
+            # Model architecture
+            img_size=config.get("img_size", (96, 96, 96)),  # Should match your patch_size
+            in_channels=config["input_channels"],
+            out_channels=config.get("out_channels", config["input_channels"]),  # Same as input for MAE
+            feature_size=config.get("feature_size", 24),
+            spatial_dims=config.get("spatial_dims", 3),
+            depths=config.get("depths", (2, 2, 2, 2)),
+            num_heads=config.get("num_heads", (3, 6, 12, 24)),
+            window_size=config.get("window_size", (7, 7, 7)),
+
+            # Regularization
+            drop_rate=config.get("drop_rate", 0.0),
+            attn_drop_rate=config.get("attn_drop_rate", 0.0),
+            dropout_path_rate=config.get("dropout_path_rate", 0.0),
+            use_checkpoint=config.get("use_checkpoint", True),
+
+            # MAE specific
+            mask_ratio=config["mask_ratio"],
+            mask_patch_size=config["mask_patch_size"],
+
+            # Contrastive specific
+            projection_dim=config.get("projection_dim", 128),
+            projection_hidden_dim=config.get("projection_hidden_dim", 2048),
+            temperature=config.get("temperature", 0.07),
+
+            # Training parameters
+            learning_rate=config["learning_rate"],
+            weight_decay=config.get("weight_decay", 0.01),
+            warmup_epochs=config["warmup_epochs"],
+            epochs=config["epochs"],
+            steps_per_epoch=config["steps_per_epoch"],
+            cosine_period_ratio=config.get("cosine_period_ratio", 1.0),
+
+            # Loss weights
+            mae_weight=config.get("mae_weight", 1.0),
+            contrastive_weight=config.get("contrastive_weight", 5.0),
+
+            # Other
+            normalize=config.get("normalize", True),
+            use_v2=config.get("use_v2", False),
+            disable_image_logging=config.get("disable_image_logging", False),
+            debug_losses=config.get("debug_losses", False),
+        )
 
     # Initialize wandb logging
     wandb.init(
@@ -231,7 +312,7 @@ def main():
     )
 
     # Create wandb logger for Lightning
-    wandb_logger = L.pytorch.loggers.WandbLogger(
+    wandb_logger = WandbLogger(
         project="fomo25",
         name=f"{config['experiment']}_version_{config['version']}",
         entity="matejgazda-technical-university-of-kosice",
@@ -249,7 +330,7 @@ def main():
     )
     callbacks = [checkpoint_callback]
 
-    trainer = L.Trainer(
+    trainer = pl.Trainer(
         logger=wandb_logger,
         callbacks=callbacks,
         accelerator="auto" if torch.cuda.is_available() else "cpu",
@@ -258,7 +339,7 @@ def main():
         devices=config["num_devices"],
         default_root_dir=config["save_dir"],
         max_epochs=config["epochs"],
-        precision=config["precision"],
+        precision='16-mixed',
         fast_dev_run=config["fast_dev_run"],
         limit_val_batches=config["limit_val_batches"],
         limit_train_batches=config["limit_train_batches"],
@@ -268,7 +349,11 @@ def main():
         accumulate_grad_batches=config["accumulate_grad_batches"],
     )
 
-    trainer.fit(model=model, datamodule=data, ckpt_path="last")
+    logging.info('-----------MATO-PRETRAINING STARTED-----------')
+    logging.info(f'datamodule={data}')
+    logging.info(f"args.model: '{args.model}'")
+
+    trainer.fit(model=model, datamodule=data)
     trainer.print(f"Memory used: {torch.cuda.max_memory_allocated() / 1e9:.02f} GB")
 
     # Close the wandb logging session

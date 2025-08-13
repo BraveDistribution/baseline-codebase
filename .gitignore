@@ -1,4 +1,6 @@
 _models
+models/
+models_supervised_transformer/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

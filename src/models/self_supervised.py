@@ -1,6 +1,6 @@
 import copy
 from typing import List
-import lightning as L
+import pytorch_lightning as L
 import torch
 import torch.nn as nn
 from torch.optim import Adam, AdamW

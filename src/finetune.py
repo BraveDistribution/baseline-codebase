@@ -4,10 +4,11 @@ import argparse
 import os
 import logging
 import torch
-import lightning as L
+import pytorch_lightning as L
 import wandb
-from lightning.pytorch.callbacks import ModelCheckpoint
+from pytorch_lightning.callbacks import ModelCheckpoint
 
+from pytorch_lightning.loggers import WandbLogger
 from models.supervised_base import BaseSupervisedModel
 from augmentations.finetune_augmentation_presets import (
     get_finetune_augmentation_params,
@@ -242,7 +243,7 @@ def main():
     )
 
     # Create wandb logger for Lightning
-    wandb_logger = L.pytorch.loggers.WandbLogger(
+    wandb_logger = WandbLogger(
         project="fomo-finetuning",
         name=f"{config['experiment']}_version_{config['version']}",
         log_model=True,

@@ -6,7 +6,7 @@ SRC_DIR="$SCRIPT_DIR/../src"
 LOG_FILE="$SCRIPT_DIR/data_preproc_pretrain.log"
 
 # Redirect all output to log file
-exec > "$LOG_FILE" 2>&1
+# exec > "$LOG_FILE" 2>&1
 
 # Check if we are in the correct virtual environment
 if [[ "$VIRTUAL_ENV" != *".venv_fomo"* ]]; then
@@ -27,5 +27,11 @@ else
 fi
 
 # Run the preprocessing script
-echo "Running preprocessing script..."
-python $SRC_DIR/data/fomo-60k/preprocess.py --in_path=data/fomo-60k/preprocess.py --in_path=/home/mg873uh/Projects_kb/data/pretrain --out_path=/home/mg873uh/Projects_kb/data/pretrain_preproc --out_path=/home/mg873uh/Projects_kb/data/pretrain_preproc
+echo "Running unifying script..."
+python $SRC_DIR/data/fomo-60k/unify_shapes.py \
+    --in_path=/home/mg873uh/Projects_kb/data/finetuning_preproc/Task001_FOMO1/ \
+    --out_path=/home/mg873uh/Projects_kb/data/finetuning_preproc/Task001_FOMO1_2.667mm_float16/ \
+    --target_element_type=float16 \
+    --target_spacing=2.6667 \
+    --target_shape 96 96 96 \
+#    --do_conversion

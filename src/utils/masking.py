@@ -11,14 +11,13 @@ def generate_random_mask(
 
     dim = len(x.shape) - 2
     assert dim in [2, 3]
-    assert x.shape[2] == x.shape[3] if dim == 2 else True
-    assert x.shape[2] == x.shape[3] == x.shape[4] if dim == 3 else True
 
-    # check if x.shape is divisible by patch_size
-    assert x.shape[2] % patch_size == 0, f"Shape: {x.shape}, Patch size: {patch_size}"
+    # check if all spatial dimensions are divisible by patch_size
+    for i in range(2, len(x.shape)):
+        assert x.shape[i] % patch_size == 0, f"Shape: {x.shape}, Patch size: {patch_size}, Dim {i} not divisible"
 
     mask = generate_1d_mask(x, mask_ratio, patch_size, out_type)
-    mask = reshape_to_dim(mask, dim)
+    mask = reshape_to_dim(mask, x.shape, patch_size)
 
     up_mask = upsample_mask(mask, patch_size)
 
@@ -30,7 +29,10 @@ def generate_1d_mask(x: torch.Tensor, mask_ratio: float, patch_size: int, out_ty
     assert out_type in [int, bool]
 
     N = x.shape[0]
-    L = (x.shape[2] // patch_size) ** (len(x.shape) - 2)
+    # Calculate total number of patches by multiplying patches along each spatial dimension
+    L = 1
+    for i in range(2, len(x.shape)):
+        L *= (x.shape[i] // patch_size)
 
     len_keep = int(L * (1 - mask_ratio))
 
@@ -54,16 +56,20 @@ def generate_1d_mask(x: torch.Tensor, mask_ratio: float, patch_size: int, out_ty
     return mask  # (B, H * W) 0 or False is keep, 1 or True is remove
 
 
-def reshape_to_dim(mask: torch.Tensor, dim: int):
+def reshape_to_dim(mask: torch.Tensor, original_shape: tuple, patch_size: int):
+    dim = len(original_shape) - 2
     assert dim in [2, 3]
     assert len(mask.shape) == 2
 
-    p = round(mask.shape[1] ** (1 / dim))
-
     if dim == 2:
-        return mask.reshape(-1, p, p)
+        h_patches = original_shape[2] // patch_size
+        w_patches = original_shape[3] // patch_size
+        return mask.reshape(-1, h_patches, w_patches)
     else:
-        return mask.reshape(-1, p, p, p)
+        h_patches = original_shape[2] // patch_size
+        w_patches = original_shape[3] // patch_size
+        z_patches = original_shape[4] // patch_size
+        return mask.reshape(-1, h_patches, w_patches, z_patches)
 
 
 def upsample_mask(mask: torch.Tensor, scale: int):

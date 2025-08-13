@@ -1,15 +1,16 @@
-import lightning as pl
+import pytorch_lightning as pl
 from torchvision.transforms import Compose
 import logging
 import torch
+import os
 from typing import Literal, Optional, Tuple
 from torch.utils.data import DataLoader, Sampler
 from yucca.pipeline.configuration.split_data import SplitConfig
 from yucca.functional.array_operations.matrix_ops import get_max_rotated_size
 from yucca.modules.data.augmentation.transforms.Spatial import Spatial
 
-from data.dataset import PretrainDataset
-
+from data.dataset import PretrainDataset, PretrainDatasetCombinedPatient, TrackedUniquePatientBatchSampler, CombinedPretrainingV2
+from sklearn.model_selection import train_test_split
 
 class PretrainDataModule(pl.LightningDataModule):
     def __init__(
@@ -24,12 +25,16 @@ class PretrainDataModule(pl.LightningDataModule):
         val_sampler: Optional[Sampler] = None,
         composed_train_transforms: Optional[Compose] = None,
         composed_val_transforms: Optional[Compose] = None,
+        dataset="default",
+        crop: bool = False,
     ):
         super().__init__()
 
+        self.dataset = dataset
         # extract parameters
         self.batch_size = batch_size
         self.patch_size = patch_size
+        self.crop = crop
 
         self.split_idx = split_idx
         self.splits_config = splits_config
@@ -54,7 +59,7 @@ class PretrainDataModule(pl.LightningDataModule):
         self.train_sampler = train_sampler
         self.val_sampler = val_sampler
 
-        logging.info(f"Using {self.num_workers} workers")
+        logging.info(f"Using {self.num_workers} workers for data loading (Data Module)")
 
     def setup(self, stage: Literal["fit", "test", "predict"]):
         assert stage == "fit"
@@ -67,69 +72,101 @@ class PretrainDataModule(pl.LightningDataModule):
         self.train_samples = self.splits_config.train(self.split_idx)
         self.val_samples = self.splits_config.val(self.split_idx)
 
-        self.train_dataset = PretrainDataset(
-            self.train_samples,
-            data_dir=self.train_data_dir,
-            composed_transforms=self.composed_train_transforms,
-            pre_aug_patch_size=self.pre_aug_patch_size,  # type: ignore
-            patch_size=self.patch_size,
-        )
+        logging.info(f"Train samples: {len(self.train_samples)}")
+        logging.info(f"Val samples: {len(self.val_samples)}")
 
-        self.val_dataset = PretrainDataset(
-            self.val_samples,
-            data_dir=self.train_data_dir,
-            composed_transforms=self.composed_val_transforms,
-            patch_size=self.patch_size,
-        )
+        if self.dataset == 'default':
+            self.train_dataset = PretrainDataset(
+                self.train_samples,
+                data_dir=self.train_data_dir,
+                composed_transforms=self.composed_train_transforms,
+                pre_aug_patch_size=self.pre_aug_patch_size,  # type: ignore
+                patch_size=self.patch_size,
+            )
+
+            self.train_batch_sampler = (self.train_sampler(self.train_dataset) if self.train_sampler is not None else None)
+
+            self.val_dataset = PretrainDataset(
+                self.val_samples,
+                data_dir=self.train_data_dir,
+                composed_transforms=self.composed_val_transforms,
+                patch_size=self.patch_size,
+            )
+            self.val_batch_sampler = (self.val_sampler(self.val_dataset) if self.val_sampler is not None else None)
+
+        elif self.dataset == 'contrastive':
+            all_studies = os.listdir(self.train_data_dir)
+            all_studies = set([study.split('_')[1] for study in all_studies if study.endswith('.npy')])
+            self.train_patients, self.val_patients = train_test_split(
+                list(all_studies),
+                train_size=0.9,
+                random_state=42
+            )
+
+            self.train_dataset = CombinedPretrainingV2(
+                self.train_patients,
+                data_dir=self.train_data_dir,
+                composed_transforms=self.composed_train_transforms,
+                pre_aug_patch_size=self.pre_aug_patch_size,  # type: ignore
+                patch_size=self.patch_size,
+                crop=self.crop,
+            )
+
+            self.train_batch_sampler = TrackedUniquePatientBatchSampler(
+                self.train_dataset,
+                batch_size=8,
+                drop_last=True,
+                shuffle=True
+            )
+
+            self.val_dataset = CombinedPretrainingV2(
+                self.val_patients,
+                data_dir=self.train_data_dir,
+                composed_transforms=self.composed_val_transforms,
+                patch_size=self.patch_size,
+            )
+
+            self.val_batch_sampler = TrackedUniquePatientBatchSampler(
+                self.val_dataset,
+                batch_size=8,
+                drop_last=True,
+                shuffle=True
+            )
 
     def train_dataloader(self):
         logging.info(f"Starting training with data from: {self.train_data_dir}")
-        sampler = (
-            self.train_sampler(self.train_dataset)
-            if self.train_sampler is not None
-            else None
-        )
-
-        return DataLoader(
-            self.train_dataset,
-            num_workers=self.num_workers,
-            batch_size=self.batch_size,
-            pin_memory=False,
-            sampler=sampler,
-            shuffle=sampler is None,
-        )
+        if not self.dataset == 'contrastive':
+            return DataLoader(
+                self.train_dataset,
+                num_workers=self.num_workers,
+                batch_size=self.batch_size,
+                pin_memory=False,
+                sampler=self.train_batch_sampler,
+            )
+        else:
+            return DataLoader(
+                self.train_dataset,
+                num_workers=self.num_workers,
+                pin_memory=False,
+                batch_sampler=self.train_batch_sampler,
+            )
 
     def val_dataloader(self):
-        sampler = (
-            self.val_sampler(self.val_dataset) if self.val_sampler is not None else None
-        )
-
-        return DataLoader(
-            self.val_dataset,
-            num_workers=self.num_workers,
-            batch_size=self.batch_size,
-            pin_memory=False,
-            sampler=sampler,
-        )
-
-        
-class PretrainDataModulePatientCombined(pl.LightningDataModule):
-    def __init__(
-        self,
-        patch_size: Tuple[int, int, int],
-        batch_size: int,
-        num_workers: int,
-        splits_config: SplitConfig,
-        split_idx: int,
-        train_data_dir: str,
-        train_sampler: Optional[Sampler] = None,
-        val_sampler: Optional[Sampler] = None,
-        composed_train_transforms: Optional[Compose] = None,
-        composed_val_transforms: Optional[Compose] = None,
-    ):    
-        pass
-
-
+        if not self.dataset == 'contrastive':
+            return DataLoader(
+                self.val_dataset,
+                num_workers=self.num_workers,
+                batch_size=self.batch_size,
+                pin_memory=False,
+                sampler=self.val_batch_sampler,
+            )
+        else:
+            return DataLoader(
+                self.val_dataset,
+                num_workers=self.num_workers,
+                pin_memory=False,
+                batch_sampler=self.val_batch_sampler,
+            )
 def augmentations_include_spatial(augmentations):
     if augmentations is None:
         return False
