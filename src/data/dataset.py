@@ -284,7 +284,7 @@ SESSION_RE = re.compile(
     r'^sub_(?P<patient>[^_]+)_ses_(?P<session>[^_]+)_(?P<modality>[^_.]+?)(?:_(?P<variant>\d+))?\.npy$'
 )
 
-class CombinedPretraining(pl.LightningDataModule):
+class CombinedPretraining(Dataset):
     def __init__(
         self,
         patients: set[str],
@@ -403,11 +403,9 @@ class CombinedPretraining(pl.LightningDataModule):
         else:
             path1 = path2 = available_modalities[0]
 
-        # --- Load raw arrays without transforms (C,D,H,W)
         def _load_raw(p):
             if p.endswith(".npy"): p = p[:-4]
             x = self._load_volume(p)
-            # sanitize
             if np.isnan(x).any() or np.isinf(x).any():
                 x = np.nan_to_num(x, nan=0.0, posinf=1.0, neginf=0.0, copy=True)
             return x
@@ -415,13 +413,7 @@ class CombinedPretraining(pl.LightningDataModule):
         v1 = _load_raw(path1)
         v2 = _load_raw(path2)
 
-        # (optional) resample v2 to v1 grid if your dataset isn’t guaranteed co-registered
-        # v2 = resample_to(v2, v1)
-
-        # --- ONE shared spatial crop for both views
         v1c, v2c = self._shared_random_crop(v1, v2)
-
-        # --- Per-view intensity transforms (keep them independent)
         d1 = {"image": v1c}
         d2 = {"image": v2c}
 
@@ -761,3 +753,127 @@ class TrackedUniquePatientBatchSampler(UniquePatientBatchSampler):
         # Print epoch summary (optional)
         if self.epoch_count % 10 == 0:
             print(f"Epoch {self.epoch_count}: Processed {len(epoch_selections)} unique patients")
+
+            
+import random
+from typing import Iterator, List, Dict
+import torch
+import torch.distributed as dist
+from torch.utils.data import Sampler
+
+
+class DistributedUniquePatientBatchSampler(Sampler):
+    """
+    Distributed version that maintains the same interface as UniquePatientBatchSampler
+    """
+    
+    def __init__(self, dataset, batch_size, drop_last=False, shuffle=True, seed=0):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        self.shuffle = shuffle
+        self.seed = seed
+        
+        self.patient_to_indices = {}
+        for idx in range(len(dataset)):
+            sample = dataset[idx]
+            patient_name = sample['patient']
+            if patient_name not in self.patient_to_indices:
+                self.patient_to_indices[patient_name] = []
+            self.patient_to_indices[patient_name].append(idx)
+        
+        self.patients = list(self.patient_to_indices.keys())
+        self.num_patients = len(self.patients)
+        
+        # Distributed settings
+        if dist.is_available() and dist.is_initialized():
+            self.num_replicas = dist.get_world_size()
+            self.rank = dist.get_rank()
+        else:
+            self.num_replicas = 1
+            self.rank = 0
+            
+        self.epoch = 0
+        self.selection_history = {}
+        
+        # Calculate how many patients each GPU should handle
+        self.num_patients_per_replica = self.num_patients // self.num_replicas
+        if self.rank == self.num_replicas - 1:
+            # Last GPU gets any remaining patients
+            self.num_patients_per_replica = self.num_patients - (self.num_replicas - 1) * self.num_patients_per_replica
+        
+        print(f"[Rank {self.rank}] DistributedUniquePatientBatchSampler initialized:")
+        print(f"  Total patients: {self.num_patients}")
+        print(f"  Patients for this GPU: {self.num_patients_per_replica}")
+        print(f"  World size: {self.num_replicas}")
+        print(f"  Batch size: {batch_size}")
+
+    def set_epoch(self, epoch: int):
+        """Set the epoch for proper shuffling across GPUs"""
+        self.epoch = epoch
+
+    def __iter__(self) -> Iterator[List[int]]:
+        # Create deterministic shuffle based on epoch
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+        
+        # Shuffle patients deterministically (all GPUs get same order)
+        if self.shuffle:
+            indices = torch.randperm(len(self.patients), generator=g).tolist()
+            patients_order = [self.patients[i] for i in indices]
+        else:
+            patients_order = self.patients.copy()
+        
+        # Split patients among GPUs
+        patients_per_replica = len(patients_order) // self.num_replicas
+        start_idx = self.rank * patients_per_replica
+        end_idx = start_idx + patients_per_replica
+        
+        # Last GPU gets remaining patients
+        if self.rank == self.num_replicas - 1:
+            end_idx = len(patients_order)
+            
+        my_patients = patients_order[start_idx:end_idx]
+        
+        # Generate batches for this GPU
+        batch = []
+        for patient in my_patients:
+            # Select index for this patient
+            available_indices = self.patient_to_indices[patient]
+            
+            # If patient has multiple samples, try to select different ones
+            if len(available_indices) > 1:
+                if patient not in self.selection_history:
+                    self.selection_history[patient] = []
+                
+                recent_indices = self.selection_history[patient][-3:]
+                unused_indices = [idx for idx in available_indices if idx not in recent_indices]
+                
+                if unused_indices:
+                    idx_pos = int(torch.randint(len(unused_indices), (1,), generator=g))
+                    idx = unused_indices[idx_pos]
+                else:
+                    idx_pos = int(torch.randint(len(available_indices), (1,), generator=g))
+                    idx = available_indices[idx_pos]
+                
+                self.selection_history[patient].append(idx)
+            else:
+                idx = available_indices[0]
+            
+            batch.append(idx)
+            
+            if len(batch) == self.batch_size:
+                yield batch
+                batch = []
+        
+        # Handle last batch
+        if len(batch) > 0 and not self.drop_last:
+            yield batch
+    
+    def __len__(self) -> int:
+        """Returns the number of batches per epoch for this replica"""
+        my_patients = self.num_patients_per_replica
+        if self.drop_last:
+            return my_patients // self.batch_size
+        else:
+            return (my_patients + self.batch_size - 1) // self.batch_size

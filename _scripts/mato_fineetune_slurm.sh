@@ -1,13 +1,13 @@
 #!/bin/bash
-#SBATCH --job-name=contrastive_pretrain
+#SBATCH --job-name=finetune_classification
 #SBATCH --output=logs/slurm_%j.out
 #SBATCH --error=logs/slurm_%j.err
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=4
+#SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
-#SBATCH --gpus-per-node=4
+#SBATCH --gpus-per-node=1
 #SBATCH --mem=64G
-#SBATCH --time=24:00:00
+#SBATCH --time=12:00:00
 #SBATCH --partition=dgx
 
 # Create logs directory if it doesn't exist
@@ -26,24 +26,19 @@ export NCCL_IB_DISABLE=0
 export NCCL_P2P_DISABLE=0
 
 # Training parameters
-DATA_DIR="/home/mg873uh/Projects_kb/data/pretrain_preproc/FOMO60k"
-CHECKPOINT_DIR="/home/mg873uh/Projects_kb/checkpoints"
-EXPERIMENT_NAME="contrastive_2gpu_${SLURM_JOB_ID}"
+DATA_DIR="/home/mg873uh/Projects_kb/data/finetuning_preproc/Task001_FOMO1"
+CHECKPOINT_DIR="/home/mg873uh/Projects_kb/checkpoints_finetune"
+CHECKPOINT_SAVED="/home/mg873uh/Projects_kb/checkpoints/contrastive_2gpu_1131/last.ckpt"
+EXPERIMENT_NAME="classification_${SLURM_JOB_ID}"
 
 echo "SLURM allocated GPUs. CUDA_VISIBLE_DEVICES is set to: $CUDA_VISIBLE_DEVICES"
 
 # Run training script
-srun python /home/mg873uh/Projects_kb/baseline-codebase/src/pretrain_transformer.py \
+srun python /home/mg873uh/Projects_kb/baseline-codebase/src/finetune_classification_transformer.py \
     --data_dir=$DATA_DIR \
-    --model_checkpoint_dir=$CHECKPOINT_DIR \
+    --save_checkpoint_dir=$CHECKPOINT_DIR \
+    --model_checkpoint=$CHECKPOINT_SAVED \
     --experiment_name=$EXPERIMENT_NAME \
-    --epochs=100 \
+    --numepochs=100 \
     --batch_size=10 \
-    --learning_rate=1e-4 \
-    --mae_mask_ratio=0.6 \
-    --mask_patch_size=4 \
-    --accumulate_grad_batches=5 \
-    --checkpoint_every_n_epoch=5 
-    # --resume_from_checkpoint=/home/mg873uh/Projects_kb/checkpoints/contrastive_2gpu_1121/epoch=00.ckpt
-
 echo "Training completed!"

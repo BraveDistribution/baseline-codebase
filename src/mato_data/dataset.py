@@ -34,6 +34,8 @@ class ContrastivePatientDataset(Dataset):
     def _load_volume_and_header(self, file):
         vol = self._load_volume(file)
         header = load_pickle(file[: -len(".npy")] + ".pkl")
+        if np.isnan(vol).any() or np.isinf(vol).any():
+            vol = np.nan_to_num(vol, nan=0.0, posinf=1.0, neginf=0.0, copy=True)
         return vol, header
 
     def populate_paths(self):

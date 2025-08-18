@@ -126,7 +126,6 @@ def finetune(checkpoint_path: str | None,
         log_model=True,
     )
 
-    # Create dataset splits
     if split_method == "kfold":
         split_param = int(split_param)
     elif split_method == "simple_train_val_split":

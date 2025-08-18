@@ -23,15 +23,17 @@ def train(
     accumulate_grad_batches: int = 3,
     checkpoint_every_n_epoch: int = 1,
     experiment_name: str = "default_experiment",
+    resume_from_checkpoint: str | Path | None = None,
 ) -> None:
     save_dir: str | Path = Path(model_checkpoint_dir) / experiment_name
     transforms = None
     checkpoint_callback = ModelCheckpoint(dirpath=save_dir,
-                                          filename="{epoch:02d}",
-                                          save_top_k=5, monitor="val/loss", 
-                                          every_n_epochs=checkpoint_every_n_epoch)
+                                          filename="{epoch:02d}-{step}", every_n_train_steps=50)
     data_module = ContrastiveDataModule(data_dir=data_dir, transforms=transforms, batch_size=batch_size)
-    model = ContrastiveTransformer(patch_size, learning_rate)
+    if resume_from_checkpoint:
+        model = ContrastiveTransformer.load_from_checkpoint(resume_from_checkpoint)
+    else:
+        model = ContrastiveTransformer(patch_size, learning_rate)
     wandb_logger = WandbLogger(
         project="PretrainingFOMO25",
         name=experiment_name,
@@ -44,9 +46,11 @@ def train(
         logger=wandb_logger,
         callbacks=[checkpoint_callback],
         strategy="ddp",
-        precision="16-mixed",
+        precision="bf16-mixed",
         accumulate_grad_batches=accumulate_grad_batches,
         log_every_n_steps=10,
+        gradient_clip_val=1,
+        gradient_clip_algorithm='norm',
     )
 
     trainer.fit(model, datamodule=data_module)

@@ -9,7 +9,7 @@ from yucca.pipeline.configuration.split_data import SplitConfig
 from yucca.functional.array_operations.matrix_ops import get_max_rotated_size
 from yucca.modules.data.augmentation.transforms.Spatial import Spatial
 
-from data.dataset import PretrainDataset, PretrainDatasetCombinedPatient, TrackedUniquePatientBatchSampler, CombinedPretrainingV2
+from data.dataset import PretrainDataset, PretrainDatasetCombinedPatient, TrackedUniquePatientBatchSampler, CombinedPretrainingV2, DistributedUniquePatientBatchSampler
 from sklearn.model_selection import train_test_split
 
 class PretrainDataModule(pl.LightningDataModule):
@@ -103,20 +103,14 @@ class PretrainDataModule(pl.LightningDataModule):
                 random_state=42
             )
 
+            # Create datasets
             self.train_dataset = CombinedPretrainingV2(
                 self.train_patients,
                 data_dir=self.train_data_dir,
                 composed_transforms=self.composed_train_transforms,
-                pre_aug_patch_size=self.pre_aug_patch_size,  # type: ignore
+                pre_aug_patch_size=self.pre_aug_patch_size,
                 patch_size=self.patch_size,
                 crop=self.crop,
-            )
-
-            self.train_batch_sampler = TrackedUniquePatientBatchSampler(
-                self.train_dataset,
-                batch_size=8,
-                drop_last=True,
-                shuffle=True
             )
 
             self.val_dataset = CombinedPretrainingV2(
@@ -126,12 +120,48 @@ class PretrainDataModule(pl.LightningDataModule):
                 patch_size=self.patch_size,
             )
 
-            self.val_batch_sampler = TrackedUniquePatientBatchSampler(
-                self.val_dataset,
-                batch_size=8,
+            # Create samplers with the mapping
+            self.train_batch_sampler = DistributedUniquePatientBatchSampler(
+                self.train_dataset,
+                batch_size=10,
                 drop_last=True,
                 shuffle=True
             )
+
+            self.val_batch_sampler = DistributedUniquePatientBatchSampler(
+                self.val_dataset,
+                batch_size=10,
+                drop_last=True,
+                shuffle=True
+            )
+
+    def _build_patient_to_indices(self, dataset):
+        """Build patient_to_indices mapping from CombinedPretrainingV2 dataset"""
+        patient_to_indices = {}
+        
+        # The dataset has index_to_patient attribute
+        if hasattr(dataset, 'index_to_patient'):
+            for idx in range(len(dataset.index_to_patient)):
+                patient_name, _ = dataset.index_to_patient[idx]
+                if patient_name not in patient_to_indices:
+                    patient_to_indices[patient_name] = []
+                patient_to_indices[patient_name].append(idx)
+        else:
+            # Fallback: iterate through dataset
+            for idx in range(len(dataset)):
+                try:
+                    sample = dataset[idx]
+                    patient_name = sample['patient']
+                    if patient_name not in patient_to_indices:
+                        patient_to_indices[patient_name] = []
+                    patient_to_indices[patient_name].append(idx)
+                except Exception as e:
+                    print(f"Warning: Could not get patient for index {idx}: {e}")
+                    continue
+        
+        print(f"Built patient_to_indices mapping with {len(patient_to_indices)} patients")
+        return patient_to_indices
+
 
     def train_dataloader(self):
         logging.info(f"Starting training with data from: {self.train_data_dir}")
