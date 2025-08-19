@@ -9,6 +9,8 @@ task1_config = {
     "task_type": "classification",
     "label_extension": ".txt",
     "labels": {0: "Negative", 1: "Positive"},
+    "target_spacing": [1.0, 1.0, 1.0],
+    "target_orientation": "RAS",
 }
 
 task2_config = {
@@ -22,6 +24,8 @@ task2_config = {
     "task_type": "segmentation",
     "label_extension": ".txt",
     "labels": {0: "background", 1: "menigioma"},
+    "target_spacing": [1.0, 1.0, 1.0],
+    "target_orientation": "RAS",
 }
 
 task3_config = {
@@ -35,4 +39,6 @@ task3_config = {
     "task_type": "regression",
     "label_extension": ".txt",
     "labels": {"regression": "Age"},  # Define as regression task
+    "target_spacing": [1.0, 1.0, 1.0],
+    "target_orientation": "RAS",
 }

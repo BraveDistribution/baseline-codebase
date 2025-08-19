@@ -3,30 +3,35 @@ import argparse
 import os
 import SimpleITK as sitk
 import pickle
+import itertools
 
-def _resample_image(img_data, target_spacing, current_spacing=None):
+def _resample_image_3d(img_data_3d, target_spacing, current_spacing=None):
     """
-    Resample a NIfTI image to a target spacing using SimpleITK.
+    Resample a 3D NIfTI image to a target spacing using SimpleITK.
 
     Args:
-        img_data (np.ndarray): Image data array
+        img_data_3d (np.ndarray): 3D image data array
         target_spacing (float): Target pixel/voxel spacing
-        current_spacing (tuple, optional): Current spacing. If None, assumes isotropic spacing of 1.0
+        current_spacing (tuple, optional): Current spacing for 3D volume. If None, assumes isotropic spacing of 1.0
 
     Returns:
-        np.ndarray: Resampled image data
+        np.ndarray: Resampled 3D image data
     """
+
+    # Ensure we have 3D data
+    if len(img_data_3d.shape) != 3:
+        raise ValueError(f"Expected 3D data, got {len(img_data_3d.shape)}D data with shape {img_data_3d.shape}")
 
     # Set current spacing if not provided, otherwise assume isotropic spacing of 1.0
     if current_spacing is None:
-        current_spacing = [1.0] * len(img_data.shape)
+        current_spacing = [1.0, 1.0, 1.0]
 
     # Check if resampling is needed - avoid unnecessary computation
     if all(abs(cs - target_spacing) < 1e-6 for cs in current_spacing):
-        return img_data
+        return img_data_3d
 
     # Convert numpy array to SimpleITK image
-    sitk_image = sitk.GetImageFromArray(img_data)
+    sitk_image = sitk.GetImageFromArray(img_data_3d)
     sitk_image.SetSpacing(current_spacing)
 
     # Calculate new size based on target spacing
@@ -55,6 +60,72 @@ def _resample_image(img_data, target_spacing, current_spacing=None):
     return resampled_array
 
 
+def _process_3d_volume(volume_3d, target_spacing, current_spacing_3d, target_shape_3d, data_type):
+    """
+    Process a single 3D volume: resample, crop and/or pad to target shape.
+
+    Args:
+        volume_3d (np.ndarray): 3D volume data
+        target_spacing (float): Target spacing for resampling
+        current_spacing_3d (list): Current spacing for the 3D volume
+        target_shape_3d (tuple): Target shape for the 3D volume (last 3 dimensions)
+        data_type (str): Target data type
+
+    Returns:
+        np.ndarray: Processed 3D volume
+    """
+    # Resample to target spacing
+    resampled_volume = _resample_image_3d(volume_3d, target_spacing, current_spacing_3d)
+
+    # Crop and/or pad to the target shape and center the volume
+    result_volume = np.zeros(target_shape_3d, dtype=data_type)
+
+    # Calculate cropping/padding for each dimension
+    for dim in range(3):
+        resampled_size = resampled_volume.shape[dim]
+        target_size = target_shape_3d[dim]
+
+        if resampled_size > target_size:
+            # Need to crop: center the crop
+            crop_start = (resampled_size - target_size) // 2
+            crop_end = crop_start + target_size
+            if dim == 0:
+                resampled_volume = resampled_volume[crop_start:crop_end, :, :]
+            elif dim == 1:
+                resampled_volume = resampled_volume[:, crop_start:crop_end, :]
+            else:  # dim == 2
+                resampled_volume = resampled_volume[:, :, crop_start:crop_end]
+
+    # Now handle padding (center the volume in the target shape)
+    offsets = [(target_size - resampled_size) // 2 for resampled_size, target_size in zip(resampled_volume.shape, target_shape_3d)]
+    slices = tuple(slice(offset, offset + s) for offset, s in zip(offsets, resampled_volume.shape))
+    result_volume[slices] = resampled_volume
+
+    return result_volume
+
+
+def _get_3d_spacing_from_metadata(current_spacing, img_shape):
+    """
+    Extract 3D spacing from metadata, handling cases where spacing might have more or fewer dimensions.
+
+    Args:
+        current_spacing (list): Current spacing from metadata
+        img_shape (tuple): Shape of the image array
+
+    Returns:
+        list: 3D spacing for the last 3 dimensions
+    """
+    if len(current_spacing) >= 3:
+        # Use the last 3 elements for 3D spacing
+        return current_spacing[-3:]
+    elif len(current_spacing) == len(img_shape):
+        # Use the last 3 elements if spacing matches image dimensions
+        return current_spacing[-3:]
+    else:
+        # Default to isotropic spacing
+        return [1.0, 1.0, 1.0]
+
+
 def unify_dataset_shape(
     src_dataset_path: str,
     dst_dataset_path: str,
@@ -69,6 +140,12 @@ def unify_dataset_shape(
     Place the sample in the center of the image and fill the empty space with zeros by padding.
     Save the unified images to the destination directory while preserving the original subfolders structure.
     Resample the images to the specified target spacing using metadata from pickle files.
+
+    This function supports multi-dimensional arrays by iterating through higher dimensions
+    and applying the unifying process to each 3D volume defined by the last three dimensions.
+    For arrays with more than 3 dimensions, the function preserves the higher dimensions
+    and processes each 3D spatial volume independently.
+
     This function assumes that the images are in npy format with corresponding pkl metadata files.
     It will also create the destination directory if it does not exist.
 
@@ -76,6 +153,10 @@ def unify_dataset_shape(
         src_dataset_path (str): Path to the source dataset directory.
         dst_dataset_path (str): Path to the destination dataset directory.
         target_spacing (float): The target spacing to resample the images to.
+        target_shape (tuple): Target shape for the spatial (last 3) dimensions only.
+                             For multi-dimensional data, this should be a 3-tuple.
+        target_element_type (str): Target data type for output arrays.
+        do_conversion (bool): Whether to perform the actual conversion or just analysis.
     """
 
     # ensure dir exists
@@ -110,6 +191,7 @@ def unify_dataset_shape(
     # Find the maximum size in each dimension after resampling
     max_shape = None
     resampled_shapes = {}
+    default_spacing = [1.0, 1.0, 1.0]  # Default spacing if no metadata is available
 
     for root, _, files in os.walk(src_dataset_path):
         for file in files:
@@ -126,9 +208,8 @@ def unify_dataset_shape(
                 pkl_path = os.path.join(root, pkl_file)
 
                 if not os.path.exists(pkl_path):
-                    print(f"Warning: No pickle file found for {file}, using default spacing and loading size from npy file...")
                     # Use default spacing and get size from npy file
-                    current_spacing = [1.0, 1.0, 1.0]
+                    current_spacing = default_spacing
                     npy_path = os.path.join(root, file)
                     img_data = np.load(npy_path)
                     current_size = list(img_data.shape)
@@ -138,7 +219,7 @@ def unify_dataset_shape(
                         metadata = pickle.load(f)
 
                     # Get current spacing and size from metadata
-                    current_spacing = metadata.get('new_spacing', [1.0, 1.0, 1.0])
+                    current_spacing = metadata.get('new_spacing', default_spacing)
                     current_size = metadata.get('new_size', metadata.get('size_after_transpose', None))
 
                     if current_size is None:
@@ -147,13 +228,30 @@ def unify_dataset_shape(
                         img_data = np.load(npy_path)
                         current_size = list(img_data.shape)
 
-                # Calculate new size after resampling to target spacing
-                resampled_size = []
-                for i, (curr_sp, size) in enumerate(zip(current_spacing, current_size)):
-                    new_size = int(round(size * (curr_sp / target_spacing)))
-                    resampled_size.append(new_size)
+                # print(f"Processing file: {file} with spacing {current_spacing} and size {current_size}")
 
-                resampled_size = tuple(resampled_size)
+                # For multi-dimensional arrays, we only consider the last 3 dimensions for spatial resampling
+                if len(current_size) < 3:
+                    print(f"Warning: File {file} has fewer than 3 dimensions ({len(current_size)}D). Skipping.")
+                    continue
+
+                # Extract 3D spatial dimensions (last 3 dimensions)
+                spatial_size_3d = current_size[-3:]
+                current_spacing_3d = _get_3d_spacing_from_metadata(current_spacing, current_size)
+
+                # Calculate new size after resampling to target spacing (only for 3D spatial dimensions)
+                resampled_size_3d = []
+                for i, (curr_sp, size) in enumerate(zip(current_spacing_3d, spatial_size_3d)):
+                    new_size = int(round(size * (curr_sp / target_spacing)))
+                    resampled_size_3d.append(new_size)
+
+                # For multi-dimensional arrays, preserve higher dimensions and resample spatial dimensions
+                if len(current_size) > 3:
+                    # Keep higher dimensions unchanged, update spatial dimensions
+                    resampled_size = tuple(current_size[:-3]) + tuple(resampled_size_3d)
+                else:
+                    # 3D case
+                    resampled_size = tuple(resampled_size_3d)
                 resampled_shapes[os.path.join(root, file)] = resampled_size
 
                 # Update maximum shape
@@ -165,11 +263,32 @@ def unify_dataset_shape(
     print(f"Maximum resampled shape: {max_shape}")
     print(f"Requested target shape: {target_shape}")
     if target_shape is not None:
-        #TODO[Khamyl]: To get rid of this assert implement cropping and padding
-        assert len(target_shape) == len(max_shape), f"Target shape {target_shape} and max shape {max_shape} must have the same number of dimensions."
-        assert all(ts >= ms for ts, ms in zip(target_shape, max_shape)), \
-            f"Each element of target_shape {target_shape} must be >= corresponding element in max_shape {max_shape}"
-    max_shape = tuple(max_shape) if target_shape is None else tuple(target_shape)
+        # For multi-dimensional support, target_shape should only specify the spatial (last 3) dimensions
+        if len(max_shape) > 3:
+            # Check that target_shape matches the spatial dimensions
+            if len(target_shape) != 3:
+                raise ValueError(f"For multi-dimensional data, target_shape must specify 3D spatial dimensions, got {len(target_shape)} dimensions")
+            # Combine higher dimensions from max_shape with target spatial dimensions
+            full_target_shape = max_shape[:-3] + tuple(target_shape)
+            max_shape_spatial = max_shape[-3:]
+        else:
+            # 3D case
+            full_target_shape = tuple(target_shape)
+            max_shape_spatial = max_shape
+
+        # Use the target shape as the final shape (crop and pad as needed)
+        max_shape = full_target_shape
+
+        # Inform user about cropping vs padding for each spatial dimension
+        for dim, (target_dim, max_dim) in enumerate(zip(target_shape, max_shape_spatial)):
+            if target_dim < max_dim:
+                print(f"  Spatial dimension {dim}: Will crop from {max_dim} to {target_dim}")
+            elif target_dim > max_dim:
+                print(f"  Spatial dimension {dim}: Will pad from {max_dim} to {target_dim}")
+            else:
+                print(f"  Spatial dimension {dim}: No change needed ({target_dim})")
+    else:
+        max_shape = tuple(max_shape)
     print(f"The shape will be: {max_shape}")
 
     # Calculate total dataset size if all files are converted to max_shape
@@ -240,23 +359,53 @@ def unify_dataset_shape(
 
                 if not os.path.exists(pkl_path):
                     # Use default spacing if no pickle file exists
-                    current_spacing = [1.0, 1.0, 1.0]
+                    current_spacing = default_spacing
                 else:
                     with open(pkl_path, 'rb') as f:
                         metadata = pickle.load(f)
-                    current_spacing = metadata.get('new_spacing', [1.0, 1.0, 1.0])
+                    current_spacing = metadata.get('new_spacing', default_spacing)
 
-                # Load and resample the image
+                # Load and process the image
                 img_data = np.load(file_path)
 
-                # Resample to target spacing
-                resampled_img_data = _resample_image(img_data, target_spacing, current_spacing)
+                # Get 3D spacing for spatial dimensions
+                current_spacing_3d = _get_3d_spacing_from_metadata(current_spacing, img_data.shape)
+                target_shape_3d = max_shape[-3:]  # Last 3 dimensions are spatial
 
-                # Pad to the maximum shape and center the image
-                padded_img_data = np.zeros(max_shape, dtype=data_type)
-                offsets = [(m - s) // 2 for s, m in zip(resampled_img_data.shape, max_shape)]
-                slices = tuple(slice(offset, offset + s) for offset, s in zip(offsets, resampled_img_data.shape))
-                padded_img_data[slices] = resampled_img_data
+                # Handle multi-dimensional arrays
+                if len(img_data.shape) > 3:
+                    # Multi-dimensional case: iterate through higher dimensions
+                    print(f"Processing multi-dimensional file {file} with shape {img_data.shape}")
+                    print(f"Will process {np.prod(img_data.shape[:-3])} individual 3D volumes")
+
+                    # Create output array with the target shape
+                    processed_img_data = np.zeros(max_shape, dtype=data_type)
+
+                    # Get the shape of higher dimensions
+                    higher_dims_shape = img_data.shape[:-3]
+
+                    # Iterate through all combinations of higher dimension indices
+                    for indices in itertools.product(*[range(dim) for dim in higher_dims_shape]):
+                        # Extract 3D volume using the indices
+                        volume_3d = img_data[indices]
+
+                        # Process the 3D volume
+                        processed_volume = _process_3d_volume(
+                            volume_3d, target_spacing, current_spacing_3d, target_shape_3d, data_type
+                        )
+
+                        # Place the processed volume back into the result array
+                        processed_img_data[indices] = processed_volume
+
+                elif len(img_data.shape) == 3:
+                    # 3D case: process directly
+                    print(f"Processing 3D file {file} with shape {img_data.shape}")
+                    processed_img_data = _process_3d_volume(
+                        img_data, target_spacing, current_spacing_3d, target_shape_3d, data_type
+                    )
+                else:
+                    print(f"Warning: Skipping file {file} with unsupported dimensionality {len(img_data.shape)}D")
+                    continue
 
                 # Save the unified image
                 relative_path = os.path.relpath(root, src_dataset_path)
@@ -267,7 +416,7 @@ def unify_dataset_shape(
                     os.makedirs(dst_dir)
 
                 dst_file_path = os.path.join(dst_dir, file)
-                np.save(dst_file_path, padded_img_data)
+                np.save(dst_file_path, processed_img_data)
 
 
 if __name__ == "__main__":

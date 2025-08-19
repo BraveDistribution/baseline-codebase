@@ -86,6 +86,8 @@ def process_subject(task_info):
                 allow_missing_modalities=False,
                 crop_to_nonzero=pp_config["crop_to_nonzero"],
                 keep_aspect_ratio_when_using_target_size=pp_config["keep_aspect_ratio"],
+                target_orientation=pp_config["target_orientation"],
+                target_spacing=pp_config["target_spacing"],
             )
         )
 

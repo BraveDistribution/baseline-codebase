@@ -29,8 +29,8 @@ fi
 # Run the preprocessing script
 echo "Running unifying script..."
 python $SRC_DIR/data/fomo-60k/unify_shapes.py \
-    --in_path=/home/mg873uh/Projects_kb/data/finetuning_preproc/Task001_FOMO1/ \
-    --out_path=/home/mg873uh/Projects_kb/data/finetuning_preproc/Task001_FOMO1_2.667mm_float16/ \
+    --in_path=/home/mg873uh/Projects_kb/data/finetuning_preproc/Task003_FOMO3/ \
+    --out_path=/home/mg873uh/Projects_kb/data/finetuning_preproc/Task003_FOMO3_2.667mm_float16/ \
     --target_element_type=float16 \
     --target_spacing=2.6667 \
     --target_shape 96 96 96 \

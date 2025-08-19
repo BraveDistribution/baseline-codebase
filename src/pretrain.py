@@ -2,6 +2,7 @@
 
 import os
 import torch
+torch.set_float32_matmul_precision('medium')
 import pytorch_lightning as pl
 import argparse
 import warnings
@@ -61,7 +62,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--fast_dev_run", action="store_true")
-    parser.add_argument("--num_devices", type=int, default=1)
+    parser.add_argument("--num_devices", type=int, default=2)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--compile_mode", type=str, default=None)
@@ -123,7 +124,27 @@ def main():
     # Configure training environment
     seed = setup_seed(continue_from_most_recent)
 
-    # Create dataset splits
+    from pytorch_lightning.callbacks import Callback
+
+
+    class DistributedSamplerCallback(Callback):
+        """
+        Callback to properly set epoch for distributed samplers.
+        This ensures different shuffling each epoch across GPUs.
+        """
+        
+        def on_train_epoch_start(self, trainer, pl_module):
+            # Get the dataloader
+            dataloader = trainer.train_dataloader
+            
+            # Check if it has a batch_sampler with set_epoch
+            if hasattr(dataloader, 'batch_sampler') and hasattr(dataloader.batch_sampler, 'set_epoch'):
+                dataloader.batch_sampler.set_epoch(trainer.current_epoch)
+                
+            # Also check if dataset has set_epoch (for some implementations)
+            if hasattr(dataloader.dataset, 'set_epoch'):
+                dataloader.dataset.set_epoch(trainer.current_epoch)
+
     path_config = SimplePathConfig(train_data_dir=train_data_dir)
     splits_config = get_pretrain_split_config(
         method="simple_train_val_split",
@@ -212,6 +233,16 @@ def main():
     print(f"Patch size: {config['patch_size']}")
     print(f"Train_data_dir: {train_data_dir}")
     print("-" * 130)
+    # Create checkpoint callback
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=version_dir,
+        filename="{epoch:02d}",
+        every_n_epochs=args.checkpoint_every_n_epochs,
+        save_last=True,
+        save_top_k=5,
+        monitor="val/loss"
+    )
+    callbacks = [checkpoint_callback, DistributedSamplerCallback()]
 
     if args.model == 'contrastive':
         print('CREATING CONTRASTIVE DATA MODULE')
@@ -225,7 +256,7 @@ def main():
             composed_train_transforms=None,
             composed_val_transforms=None,
             dataset='contrastive',
-            crop=False,
+            crop=True,
         )
     else:
         data = PretrainDataModule(
@@ -259,8 +290,8 @@ def main():
         )
 
     if args.model == 'contrastive':
-        from models_custom.models import SwinUNETRPretraining
-        model = SwinUNETRPretraining(
+        from models_custom.models import SwinUNETRPretraining, SwinUNETRPretrainingDistributed
+        model = SwinUNETRPretrainingDistributed(
             # Model architecture
             img_size=config.get("img_size", (96, 96, 96)),  # Should match your patch_size
             in_channels=config["input_channels"],
@@ -319,24 +350,12 @@ def main():
         log_model=True,
     )
 
-    # Create checkpoint callback
-    checkpoint_callback = ModelCheckpoint(
-        dirpath=version_dir,
-        filename="{epoch:02d}",
-        every_n_epochs=args.checkpoint_every_n_epochs,
-        save_last=True,
-        save_top_k=5,
-        monitor="val/loss"
-    )
-    callbacks = [checkpoint_callback]
-
     trainer = pl.Trainer(
         logger=wandb_logger,
         callbacks=callbacks,
         accelerator="auto" if torch.cuda.is_available() else "cpu",
         strategy="ddp" if config["num_devices"] > 1 else "auto",
         num_nodes=1,
-        devices=config["num_devices"],
         default_root_dir=config["save_dir"],
         max_epochs=config["epochs"],
         precision='16-mixed',

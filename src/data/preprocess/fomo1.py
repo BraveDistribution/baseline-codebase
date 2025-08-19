@@ -83,6 +83,8 @@ def process_subject(task_info):
             ],
             allow_missing_modalities=False,
             crop_to_nonzero=pp_config["crop_to_nonzero"],
+            target_orientation=pp_config["target_orientation"],
+            target_spacing=pp_config["target_spacing"],
         )
 
         # Save preprocessed data
