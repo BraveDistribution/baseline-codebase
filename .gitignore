@@ -1,4 +1,9 @@
 _models
+models
+models_supervised_transformer
+wandb
+data/*
+
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -61,9 +66,6 @@ slurm-*.out
 *.err
 *.out
 *.job
-
-wandb
-data/*
 
 .ipynb_checkpoints
 .fomoenv
