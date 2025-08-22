@@ -68,7 +68,7 @@ def main():
     parser.add_argument(
         "--augmentation_preset",
         type=str,
-        choices=["all", "basic", "none"],
+        choices=["all", "all_noCrop", "basic", "none"],
         default="none",
     )
     parser.add_argument("--loss_masked_tokens_only", default=False, action="store_true")
