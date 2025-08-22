@@ -1,4 +1,6 @@
 from typing import Sequence, Tuple, Dict, Any
+from monai.losses import DiceCELoss
+from monai.metrics import DiceMetric
 
 import pytorch_lightning as pl
 import torch
@@ -536,15 +538,10 @@ class ClassificationFineTuner(pl.LightningModule):
         images = batch['image']
         labels = batch['label'].long()
         
-        # Forward pass
-        logits = self(images).squeeze()  # Remove ALL singleton dimensions
-        loss = F.binary_cross_entropy_with_logits(logits, labels.float())  # BCE expects float labels
-        
-        # Calculate accuracy
-        preds = torch.sigmoid(logits).round()
+        logits = self(images).squeeze()
+        loss = F.binary_cross_entropy_with_logits(logits, labels.float())
+        preds = torch.sigmoid(logits)
         acc = (preds == labels).float().mean()
-
-        # Logging
         self.log_dict({
             'val/loss': loss,
             'val/acc': acc,
@@ -983,10 +980,234 @@ class RegressionFineTuner(pl.LightningModule):
             'optimizer': optimizer,
         }
 
+from monai.inferers import SlidingWindowInferer  # <-- Import added
+from torch.optim.lr_scheduler import LambdaLR
+
+class SegmentationFineTuner(pl.LightningModule):
+    """
+    Fine-tunes a pre-trained SwinUNETR model for a semantic segmentation task.
+    Includes sliding window inference for validation, testing, and prediction.
+    """
+    def __init__(
+        self,
+        num_classes: int,
+        img_size: Tuple[int, int, int] = (96, 96, 96),
+        feature_size: int = 24,
+        in_channels: int = 1,
+        learning_rate: float = 1e-4,
+        freeze_encoder: bool = False,
+        warmup_epochs: int = 5,
+        max_epochs: int = 100,
+        min_lr: float = 1e-6,
+        sw_batch_size: int = 4,        # <-- Sliding window batch size
+        sw_overlap: float = 0.5,       # <-- Sliding window overlap
+    ):
+        super().__init__()
+        self.save_hyperparameters()
+
+        self.num_classes = num_classes
+        self.in_channels = in_channels
+        self.learning_rate = learning_rate
+        self.freeze_encoder = freeze_encoder
+        self.warmup_epochs = warmup_epochs
+        self.max_epochs = max_epochs
+        self.min_lr = min_lr
+
+        self.encoder = SwinUNETR(
+            img_size=img_size,
+            in_channels=in_channels,
+            out_channels=num_classes,
+            feature_size=feature_size,
+            use_checkpoint=True,
+            use_v2=True,
+        )
+
+        self.loss_function = DiceCELoss(to_onehot_y=True, softmax=True)
+        self.dice_metric = DiceMetric(include_background=True, reduction="mean", get_not_nans=False)
+        self.dice_metric_test = DiceMetric(include_background=True, reduction="mean", get_not_nans=False)
+
+        self.sliding_window_inferer = SlidingWindowInferer(
+            roi_size=img_size,
+            sw_batch_size=sw_batch_size,
+            overlap=sw_overlap,
+            mode="gaussian",     
+        )
+
+        if self.freeze_encoder:
+            self._freeze_encoder()
+            
+    def _freeze_encoder(self):
+        """Freeze encoder (SwinViT) weights."""
+        print("Freezing encoder weights.")
+        for param in self.encoder.swinViT.parameters():
+            param.requires_grad = False
+
+    def _unfreeze_encoder(self):
+        """Unfreeze encoder (SwinViT) weights."""
+        print("Unfreezing encoder weights.")
+        for param in self.encoder.swinViT.parameters():
+            param.requires_grad = True
+            
+    def adapt_to_multichannel(self, new_channels: int = 4, strategy: str = "average"):
+        """Adapt model from 1 channel to multiple channels by modifying the first conv layer."""
+        first_conv = self.encoder.swinViT.patch_embed.proj
+        if first_conv.in_channels == new_channels:
+            print(f"Model already has {new_channels} input channels.")
+            return
+
+        old_weight = first_conv.weight.data.clone()
+        new_conv = nn.Conv3d(
+            in_channels=new_channels,
+            out_channels=first_conv.out_channels,
+            kernel_size=first_conv.kernel_size,
+            stride=first_conv.stride,
+            padding=first_conv.padding,
+            bias=first_conv.bias is not None
+        )
+
+        with torch.no_grad():
+            if strategy == "average":
+                new_conv.weight.data = old_weight.repeat(1, new_channels, 1, 1, 1) / new_channels
+            elif strategy == "copy":
+                 new_conv.weight.data = old_weight.repeat(1, new_channels, 1, 1, 1)
+            else: # "first" or default
+                nn.init.kaiming_normal_(new_conv.weight.data)
+                new_conv.weight.data[:, 0:1, :, :, :] = old_weight
+
+            if first_conv.bias is not None:
+                new_conv.bias.data = first_conv.bias.data.clone()
+
+        self.encoder.swinViT.patch_embed.proj = new_conv
+        self.hparams.in_channels = new_channels
+        self.in_channels = new_channels
+        print(f"✓ Adapted model from {first_conv.in_channels} to {new_channels} channels using '{strategy}' strategy.")
+
+    @classmethod
+    def load_from_checkpoint(
+        cls,
+        checkpoint_path: str,
+        num_classes: int,
+        strict: bool = False,
+        in_channels: int = None,
+        multichannel_strategy: str = "average",
+        **kwargs
+    ):
+        """Loads a pre-trained encoder from a ContrastiveTransformer checkpoint."""
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        loaded_hparams = checkpoint.get('hyper_parameters', {})
+
+        img_size = loaded_hparams.get('img_size', (96, 96, 96))
+        feature_size = loaded_hparams.get('feature_size', 24)
+
+        kwargs.update({
+            'img_size': img_size,
+            'feature_size': feature_size,
+            'num_classes': num_classes,
+            'in_channels': 1,
+        })
+
+        model = cls(**kwargs)
+        state_dict = checkpoint['state_dict']
+        encoder_state_dict = {}
+        for k, v in state_dict.items():
+            if k.startswith('encoder.') and not k.startswith('encoder_m.'):
+                encoder_state_dict[k] = v
+
+        missing_keys, unexpected_keys = model.load_state_dict(encoder_state_dict, strict=False)
+        print(f"Loaded encoder weights from {checkpoint_path}")
+        print(f"Missing keys: {len(missing_keys)} (expected: decoder weights)")
+        print(f"Unexpected keys: {len(unexpected_keys)}")
+
+        if in_channels and in_channels > 1:
+            model.adapt_to_multichannel(new_channels=in_channels, strategy=multichannel_strategy)
+
+        return model
+
+
+    def forward(self, x):
+        """Forward pass for training on a single patch."""
+        return self.encoder(x)
+
+    def training_step(self, batch, batch_idx):
+        images, labels = batch['image'], batch['label']
+        outputs = self(images)
+        loss = self.loss_function(outputs, labels)
+        self.log('train/loss', loss, on_step=True, on_epoch=True, prog_bar=True)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        images, labels = batch['image'], batch['label']
+        outputs = self.sliding_window_inferer(inputs=images, network=self.encoder)
+        loss = self.loss_function(outputs, labels)
+
+        post_pred = torch.argmax(outputs, dim=1, keepdim=True)
+        self.dice_metric(y_pred=post_pred, y=labels)
+
+        self.log('val/loss', loss, on_epoch=True)
+        return loss
+
+    def on_validation_epoch_end(self):
+        val_dice = self.dice_metric.aggregate().item()
+        self.log('val/dice', val_dice, prog_bar=True)
+        self.dice_metric.reset()
+
+    def on_test_epoch_end(self):
+        test_dice = self.dice_metric_test.aggregate().item()
+        self.log('test/dice', test_dice)
+        self.dice_metric_test.reset()
+
+    def test_step(self, batch, batch_idx):
+        full_data_tensor = batch['data']
+        images = full_data_tensor[:, :-1]  # All channels except the last
+        labels = full_data_tensor[:, -1:]  # The last channel is the label
+        outputs = self.sliding_window_inferer(inputs=images, network=self.encoder)
+        # Calculate metrics as before
+        post_pred = torch.argmax(outputs, dim=1, keepdim=True)
+        self.dice_metric_test(y_pred=post_pred, y=labels)
+
+    def predict_step(self, batch, batch_idx, dataloader_idx=0):
+        images = batch['data']
+        prediction = self.sliding_window_inferer(inputs=images, network=self.encoder)
+        return {"prediction": prediction, "case_id": batch["case_id"]}
+
+    def configure_optimizers(self):
+        """Configure optimizer and learning rate scheduler."""
+        if self.freeze_encoder:
+            decoder_params = [p for name, p in self.encoder.named_parameters() if not name.startswith('swinViT.') and p.requires_grad]
+            params = decoder_params
+            print(f"Optimizing {len(params)} decoder parameters.")
+        else:
+            params = self.parameters()
+
+        optimizer = torch.optim.AdamW(params, lr=self.learning_rate, weight_decay=0.01)
+
+        def lr_lambda(current_step: int):
+            num_training_steps = self.trainer.estimated_stepping_batches
+            if num_training_steps == float('inf'): # Handle edge case
+                num_training_steps = self.trainer.max_epochs * len(self.trainer.datamodule.train_dataloader())
+
+            num_warmup_steps = int(num_training_steps * self.warmup_epochs / self.max_epochs)
+            
+            if current_step < num_warmup_steps:
+                return float(current_step) / float(max(1, num_warmup_steps))
+            
+            progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+            cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+            decayed = (1 - self.min_lr / self.learning_rate) * cosine_decay + self.min_lr / self.learning_rate
+            return decayed
+
+        scheduler = LambdaLR(optimizer, lr_lambda)
+        return {
+            'optimizer': optimizer,
+            'lr_scheduler': {
+                'scheduler': scheduler,
+                'interval': 'step',
+                'frequency': 1,
+            }
+        }
 
 
 if __name__ == "__main__":
-    # Load from ContrastiveTransformer checkpoint
     model = ClassificationFineTuner.load_from_checkpoint(
         '/home/mg873uh/Projects_kb/checkpoints/contrastive_2gpu_1131/last.ckpt',
         num_classes=1,
