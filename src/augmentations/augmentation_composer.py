@@ -20,13 +20,19 @@ from yucca.modules.data.augmentation.transforms.Spatial import Spatial
 
 
 def get_pretrain_augmentations(patch_size, preset):
-    assert preset in ["none", "spatial", "all"]
+    assert preset in ["none", "spatial", "all", "all_noCrop"]
 
     if preset == "none":
         augmentations = [CopyImageToLabel(copy=True)]
 
     elif preset == "spatial":
         augmentations = [spatial_augmentation(patch_size), CopyImageToLabel(copy=True)]
+
+    elif preset == "all_noCrop":
+        augmentations = [
+            spatial_augmentation(patch_size, do_crop=False),
+            CopyImageToLabel(copy=True),
+        ] + intensity_augmentations()
 
     elif preset == "all":
         augmentations = [
@@ -62,10 +68,10 @@ def get_finetune_augmentations(patch_size, preset):
     )
 
 
-def spatial_augmentation(patch_size):
+def spatial_augmentation(patch_size, do_crop=True):
     return Spatial(
         patch_size=patch_size,
-        crop=True,
+        crop=do_crop,
         random_crop=False,
         cval="min",
         p_deform_per_sample=0.33,
