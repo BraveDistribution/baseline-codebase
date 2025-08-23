@@ -17,6 +17,8 @@ LOG_FILE="$SCRIPT_DIR/run_finetuning_task${TASKID}.log"
 
 echo cuda_visible_devices: $CUDA_VISIBLE_DEVICES
 
+module load Python/3.11.5-GCCcore-13.2.0
+
 # Change to project directory
 cd /home/mg873uh/Fomo25/baseline-codebase
 
