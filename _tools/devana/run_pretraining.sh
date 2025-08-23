@@ -20,5 +20,5 @@ python src/pretrain.py \
     --epochs=100 \
     --warmup_epochs=5 \
     --num_workers=64 \
-    --augmentation_preset=all_noCrop
+    --augmentation_preset=all
 
