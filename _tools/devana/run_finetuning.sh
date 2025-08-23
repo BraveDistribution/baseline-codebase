@@ -17,11 +17,8 @@ LOG_FILE="$SCRIPT_DIR/run_finetuning_task${TASKID}.log"
 
 echo cuda_visible_devices: $CUDA_VISIBLE_DEVICES
 
-# Activate environment
-source /home/mg873uh/Projects_kb/.venv_fomo/bin/activate
-
 # Change to project directory
-cd /home/mg873uh/Projects_kb/baseline-codebase
+cd /home/mg873uh/Fomo25/baseline-codebase
 
 python src/finetune.py \
     --data_dir=/projects/p1170-25-1/data/finetuning_preproc \
