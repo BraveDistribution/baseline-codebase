@@ -12,7 +12,7 @@ from yucca.modules.data.augmentation.YuccaAugmentationComposer import (
     YuccaAugmentationComposer,
 )
 from yucca.pipeline.configuration.split_data import get_split_config
-from mato_models.models import ClassificationFineTuner, RegressionFineTuner
+from mato_models.models import ClassificationFineTuner, RegressionFineTuner, SegmentationFineTuner, ClassificationFinetuner2
 from yucca.modules.data.data_modules.YuccaDataModule import YuccaDataModule
 from yucca.modules.callbacks.loggers import YuccaLogger
 from yucca.modules.data.datasets.YuccaDataset import YuccaTrainDataset
@@ -48,6 +48,8 @@ def train(
         num_modalities = 4
     elif task_type == "regression":
         num_modalities = 2
+    elif task_type == 'segmentation':
+        num_modalities = 3
     else:
         raise ValueError(f"Unsupported task type: {task_type}")
 
@@ -58,11 +60,12 @@ def train(
         mode="min",
         save_top_k=1,
     )
-    aug_params = get_finetune_augmentation_params("basic")
-
+    # aug_params = get_finetune_augmentation_params("all")
+    aug_params = get_finetune_augmentation_params("best_practice_classification")
+    task_type_preset = "classification" if task_type == "regression" else task_type
     augmenter = YuccaAugmentationComposer(
         patch_size=[patch_size, patch_size, patch_size],
-        task_type_preset="classification",
+        task_type_preset=task_type_preset,
         parameter_dict=aug_params,
         deep_supervision=False,
     )
@@ -75,7 +78,9 @@ def train(
     )
 
     data_module = YuccaDataModule(
-        train_dataset_class=FOMODataset,
+        train_dataset_class=(
+            YuccaTrainDataset if task_type == "segmentation" else FOMODataset
+        ),
         composed_train_transforms=augmenter.train_transforms,
         composed_val_transforms=augmenter.val_transforms,
         patch_size=[patch_size, patch_size, patch_size],
@@ -96,19 +101,36 @@ def train(
     )
 
     if task_type == "classification":
-        model = ClassificationFineTuner.load_from_checkpoint(
-            str(model_checkpoint),
+        # model = ClassificationFineTuner.load_from_checkpoint(
+        #     str(model_checkpoint),
+        #     num_classes=1,
+        #     in_channels=num_modalities,
+        #     multichannel_strategy="copy",
+        #     freeze_encoder=True,
+        #     learning_rate=1e-4,
+        #     max_epochs=50,
+        # )
+        model = ClassificationFinetuner2.load_from_pretrained(
+            checkpoint_path=str(model_checkpoint),
             num_classes=1,
             in_channels=num_modalities,
-            multichannel_strategy="copy",
             freeze_encoder=True,
-            learning_rate=1e-4,
-            max_epochs=50,
+            learning_rate=1e-5, # We discussed using a lower LR for fine-tuning
+            max_epochs=50
         )
     elif task_type == "regression":
         model = RegressionFineTuner.load_from_checkpoint(
             str(model_checkpoint),
             in_channels=num_modalities,
+            freeze_encoder=True,
+            learning_rate=1e-4,
+            max_epochs=50,
+        )
+    elif task_type == 'segmentation':
+        model = SegmentationFineTuner.load_from_checkpoint(
+            str(model_checkpoint),
+            num_classes=1,
+            in_channels=3,
             freeze_encoder=True,
             learning_rate=1e-4,
             max_epochs=50,

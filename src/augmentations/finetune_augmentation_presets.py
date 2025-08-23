@@ -1,7 +1,7 @@
 from typing import Literal
 
 
-def get_finetune_augmentation_params(preset: Literal["basic", "none", "yucca_default", "all"]) -> dict:
+def get_finetune_augmentation_params(preset: Literal["basic", "none", "yucca_default", "all", "best_practice_classification"]) -> dict:
     """ "
     Get an augmentation parameter dict from a preset name.
     """
@@ -50,6 +50,19 @@ def get_finetune_augmentation_params(preset: Literal["basic", "none", "yucca_def
             "simulate_lowres_p_per_channel": 0.0,
             "simulate_lowres_p_per_axis": 0.0,
             "normalize": False,
+        }
+    elif preset == "best_practice_classification":
+        return {
+            "mirror_p_per_sample": 0.5,
+            "elastic_deform_p_per_sample": 0.3,
+            "rotation_p_per_sample": 0.3,
+            "scale_p_per_sample": 0.3,
+            "gamma_p_per_sample": 0.3,
+            "additive_noise_p_per_sample": 0.25,
+            "blurring_p_per_sample": 0.2,
+            "biasfield_p_per_sample": 0.3,
+            "motion_ghosting_p_per_sample": 0.2,
+            "gibbs_ringing_p_per_sample": 0.2,
         }
     elif preset == "all":
         return {"normalize": False}  # Will use Yucca defaults
