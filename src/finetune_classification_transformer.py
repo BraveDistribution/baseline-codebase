@@ -12,7 +12,7 @@ from yucca.modules.data.augmentation.YuccaAugmentationComposer import (
     YuccaAugmentationComposer,
 )
 from yucca.pipeline.configuration.split_data import get_split_config
-from mato_models.models import ClassificationFineTuner, RegressionFineTuner, SegmentationFineTuner, ClassificationFinetuner2
+from mato_models.models import ClassificationFineTuner, RegressionFineTuner, SegmentationFineTuner, ClassificationFinetuner2, RegressionFinetuner2
 from yucca.modules.data.data_modules.YuccaDataModule import YuccaDataModule
 from yucca.modules.callbacks.loggers import YuccaLogger
 from yucca.modules.data.datasets.YuccaDataset import YuccaTrainDataset
@@ -119,12 +119,13 @@ def train(
             max_epochs=50
         )
     elif task_type == "regression":
-        model = RegressionFineTuner.load_from_checkpoint(
+        model = RegressionFinetuner2.load_from_checkpoint(
             str(model_checkpoint),
             in_channels=num_modalities,
             freeze_encoder=True,
             learning_rate=1e-4,
             max_epochs=50,
+            strict=False
         )
     elif task_type == 'segmentation':
         model = SegmentationFineTuner.load_from_checkpoint(
@@ -140,7 +141,7 @@ def train(
         max_epochs=num_epochs,
         callbacks=[checkpoint_callback],
         logger=[wandb_logger],
-        precision="bf16-mixed",
+        precision="16-mixed",
         accelerator="gpu",
         limit_train_batches=50,
     )

@@ -26,7 +26,44 @@ def train(
     resume_from_checkpoint: str | Path | None = None,
 ) -> None:
     save_dir: str | Path = Path(model_checkpoint_dir) / experiment_name
-    transforms = None
+    import monai.transforms as T
+
+    transforms = T.Compose([
+        # Ensure data is in the expected dictionary format
+        T.AsDiscreted(keys=('vol1', 'vol2'), argmax=False),
+
+        T.RandAdjustContrastd(keys='vol1', prob=0.5, gamma=(0.8, 1.2)),
+        T.RandAdjustContrastd(keys='vol2', prob=0.5, gamma=(0.8, 1.2)),
+
+        T.RandGibbsNoised(keys='vol1', prob=0.3, alpha=(0.4, 0.8)),
+        T.RandGibbsNoised(keys='vol2', prob=0.3, alpha=(0.4, 0.8)),
+
+        T.RandGaussianNoised(keys='vol1', prob=0.3, mean=0.0, std=0.1),
+        T.RandGaussianNoised(keys='vol2', prob=0.3, mean=0.0, std=0.1),
+
+        T.RandFlipd(keys=('vol1', 'vol2'), prob=0.5, spatial_axis=0),
+        T.RandFlipd(keys=('vol1', 'vol2'), prob=0.5, spatial_axis=1),
+        T.RandFlipd(keys=('vol1', 'vol2'), prob=0.5, spatial_axis=2),
+
+        T.RandRotated(
+            keys=('vol1', 'vol2'),
+            range_x=0.1, range_y=0.1, range_z=0.1,
+            prob=0.8,
+            mode=('bilinear', 'bilinear'),
+            padding_mode='zeros'
+        ),
+
+        T.RandZoomd(
+            keys=('vol1', 'vol2'),
+            min_zoom=0.9, max_zoom=1.1,
+            prob=0.8,
+            mode=('trilinear', 'trilinear'),
+            align_corners=(True, True)
+        ),
+
+        T.ToTensord(keys=('vol1', 'vol2'))
+    ])
+
     checkpoint_callback = ModelCheckpoint(dirpath=save_dir,
                                           filename="{epoch:02d}-{step}", every_n_train_steps=50)
     data_module = ContrastiveDataModule(data_dir=data_dir, transforms=transforms, batch_size=batch_size)

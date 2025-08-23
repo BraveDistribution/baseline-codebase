@@ -18,6 +18,7 @@ SESSION_RE = re.compile(r'sub_(?P<patient>\d+)_ses_(?P<session>\d+)_(?P<scan_typ
 class ContrastivePatientDataset(Dataset):
     def __init__(self, data_dir: str | Path, patients_included: Set[str], transforms: Callable = None):
         self.data_dir = data_dir
+        self.transforms = transforms
         self.patients_included = patients_included
         self.populate_paths()
     
@@ -128,11 +129,13 @@ class ContrastivePatientDataset(Dataset):
         vol1, header1 = self._load_volume_and_header(pair_info['path1'])
         vol2, header2 = self._load_volume_and_header(pair_info['path2'])
         vol1, vol2 = self._shared_random_crop(vol1, vol2)
-        
-        return {
-            'vol1': vol1,
-            'vol2': vol2,
-        }
+
+        data_dict = {'vol1': vol1, 'vol2': vol2}
+
+        if self.transforms:
+            data_dict = self.transforms(data_dict)
+
+        return data_dict
 
 if __name__ == "__main__":
     dataset = ContrastivePatientDataset("/home/mg873uh/Projects_kb/data/pretrain_preproc/FOMO60k", set(["4972"]))
