@@ -1461,30 +1461,33 @@ class ClassificationFinetuner2(pl.LightningModule):
 
 
 
+
 class RegressionFinetuner2(pl.LightningModule):
     """
-    Implements multi-modal regression using multi-scale feature fusion.
-    Uses features from all layers of the encoder, not just the last one.
+    Implements multi-modal regression with multi-scale feature fusion.
+    This version has INCREASED CAPACITY in the projection and regression heads
+    to help learn more complex patterns.
     """
     def __init__(
         self,
-        in_channels: int,  # Expected number of modalities, e.g., 3
+        in_channels: int,
         img_size: Tuple[int, int, int] = (96, 96, 96),
         feature_size: int = 24,
         learning_rate: float = 1e-4,
         freeze_encoder: bool = True,
         dropout_rate: float = 0.3,
-        warmup_epochs: int = 5,
         max_epochs: int = 100,
         min_lr: float = 1e-6,
-        loss_type: str = "mse",
+        loss_type: str = "huber",
         loss_alpha: float = 0.5,
         **kwargs,
     ):
         super().__init__()
         self.save_hyperparameters()
 
-        # Encoder is always 1-channel for processing modalities individually
+        self.register_buffer("target_min", torch.tensor(18.0))
+        self.register_buffer("target_max", torch.tensor(110.0))
+
         self.encoder = SwinUNETR(
             in_channels=1,
             out_channels=1,
@@ -1493,113 +1496,122 @@ class RegressionFinetuner2(pl.LightningModule):
             use_v2=True,
         )
 
-        # Determine dimensions for each layer output
         with torch.no_grad():
             dummy = torch.zeros(1, 1, *img_size)
             all_features = self.encoder.swinViT(dummy)
-            # Get dimensions for all 5 layers
             self.feature_dims = [f.shape[1] for f in all_features]
         
-        # Separate pooling for each scale
         self.pools = nn.ModuleList([
             nn.AdaptiveAvgPool3d(1) for _ in range(5)
         ])
         
-        # Projection to common dimension for each scale
-        common_dim = 32  # Smaller for regression with limited data
+        # --- INCREASED CAPACITY 1 ---
+        # Increased common_dim from 32 to 64
+        common_dim = 64
         self.projections = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(dim, common_dim),
-                nn.LayerNorm(common_dim),  # Batch-size independent
+                nn.LayerNorm(common_dim),
                 nn.ReLU(),
-                nn.Dropout(dropout_rate * 0.5)  # Light dropout in projections
+                nn.Dropout(dropout_rate * 0.5)
             ) for dim in self.feature_dims
         ])
 
-        # Regression head accepts concatenated multi-scale features
+        # --- INCREASED CAPACITY 2 ---
+        # Widened and deepened the regression head
         self.regression_head = nn.Sequential(
-            nn.Linear(in_channels * 5 * common_dim, 64),  # 5 scales × 32 dims × C modalities
-            nn.LayerNorm(64),  # Instead of BatchNorm
+            nn.Linear(in_channels * 5 * common_dim, 128), # Widened from 64
+            nn.LayerNorm(128),
             nn.ReLU(),
             nn.Dropout(self.hparams.dropout_rate),
-            nn.Linear(64, 1),
+            nn.Linear(128, 128), # Added a second hidden layer
+            nn.LayerNorm(128),
+            nn.ReLU(),
+            nn.Dropout(self.hparams.dropout_rate),
+            nn.Linear(128, 1),
+            nn.Sigmoid()
         )
 
         if self.hparams.freeze_encoder:
             self._freeze_encoder()
         
         self.val_corr = PearsonCorrCoef()
-        self.val_predictions = []
-        self.val_targets = []
 
     def _freeze_encoder(self):
-        """Freeze all encoder weights and set to evaluation mode."""
         print("Freezing encoder weights and setting to .eval().")
         for param in self.encoder.parameters():
             param.requires_grad = False
         self.encoder.eval()
 
-    def forward(self, x):
+    def _normalize(self, x: torch.Tensor) -> torch.Tensor:
+        return (x - self.target_min) / (self.target_max - self.target_min)
+
+    def _unnormalize(self, x: torch.Tensor) -> torch.Tensor:
+        return x * (self.target_max - self.target_min) + self.target_min
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C = x.shape[0], x.shape[1]
         x_reshaped = x.view(B * C, 1, *x.shape[2:])
         
-        # Get ALL layer features (not just the last one)
-        all_features = self.encoder.swinViT(x_reshaped)  # List of 5 feature maps
+        all_features = self.encoder.swinViT(x_reshaped)
         
-        # Pool and project each scale
         pooled_features = []
         for i, features in enumerate(all_features):
-            pooled = self.pools[i](features)  # [B*C, dim, 1, 1, 1]
-            pooled = pooled.view(B * C, -1)   # [B*C, dim]
-            projected = self.projections[i](pooled)  # [B*C, 32]
+            pooled = self.pools[i](features)
+            pooled = pooled.view(B * C, -1)
+            projected = self.projections[i](pooled)
             pooled_features.append(projected)
         
-        # Concatenate all scales
-        multi_scale = torch.cat(pooled_features, dim=1)  # [B*C, 5*32]
-        multi_scale = multi_scale.view(B, C * 5 * 32)    # [B, C*5*32]
+        # Note: The input dimension to the head changes with common_dim
+        multi_scale = torch.cat(pooled_features, dim=1)
+        multi_scale = multi_scale.view(B, C * 5 * self.projections[0][0].out_features)
         
-        # Regress
         output = self.regression_head(multi_scale)
-        return output.squeeze(-1)  # Return shape: [batch_size]
+        return output.squeeze(-1)
 
-    def compute_loss(self, pred, target):
+    def compute_loss(self, pred_normalized, target_normalized):
         loss_type = self.hparams.loss_type
         if loss_type == "mse":
-            return F.mse_loss(pred, target)
+            return F.mse_loss(pred_normalized, target_normalized)
         elif loss_type == "mae":
-            return F.l1_loss(pred, target)
+            return F.l1_loss(pred_normalized, target_normalized)
         elif loss_type == "huber":
-            return F.smooth_l1_loss(pred, target)
+            return F.smooth_l1_loss(pred_normalized, target_normalized)
         elif loss_type == "combined":
-            mse = F.mse_loss(pred, target)
-            mae = F.l1_loss(pred, target)
+            mse = F.mse_loss(pred_normalized, target_normalized)
+            mae = F.l1_loss(pred_normalized, target_normalized)
             return self.hparams.loss_alpha * mse + (1 - self.hparams.loss_alpha) * mae
         raise ValueError(f"Unknown loss type: {loss_type}")
 
     def training_step(self, batch, batch_idx):
-        images, targets = batch['image'], batch['label'].float()
-        targets = targets.view(-1)  # Ensure proper shape
-        preds = self(images)
-        loss = self.compute_loss(preds, targets)
+        images, targets_original = batch['image'], batch['label'].float()
+        targets_original = targets_original.view(-1)
         
-        mae = F.l1_loss(preds, targets)
-        self.log_dict({'train/loss': loss, 'train/mae': mae}, prog_bar=True, on_step=True, on_epoch=True)
+        targets_normalized = self._normalize(targets_original)
+        preds_normalized = self(images)
+        loss = self.compute_loss(preds_normalized, targets_normalized)
+        
+        mae_original = F.l1_loss(self._unnormalize(preds_normalized.detach()), targets_original)
+        
+        self.log_dict({'train/loss': loss, 'train/mae_original': mae_original}, prog_bar=True, on_step=True, on_epoch=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        images, targets = batch['image'], batch['label'].float()
-        targets = targets.view(-1)  # Ensure proper shape
-        preds = self(images)
-        loss = self.compute_loss(preds, targets)
-        mae = F.l1_loss(preds, targets)
+        images, targets_original = batch['image'], batch['label'].float()
+        targets_original = targets_original.view(-1)
         
-        # Update the correlation metric state
-        self.val_corr.update(preds, targets)
+        preds_normalized = self(images)
+        targets_normalized = self._normalize(targets_original)
+        loss = self.compute_loss(preds_normalized, targets_normalized)
 
-        # Log the loss, mae, and the metric object itself
+        preds_original = self._unnormalize(preds_normalized.detach())
+        
+        mae_original = F.l1_loss(preds_original, targets_original)
+        self.val_corr.update(preds_original, targets_original)
+
         self.log_dict({
-            'val/loss': loss, 
-            'val/mae': mae,
+            'val/loss': loss,  
+            'val/mae_original': mae_original,
             'val/correlation': self.val_corr,
         }, prog_bar=True, on_epoch=True)
 
@@ -1607,11 +1619,8 @@ class RegressionFinetuner2(pl.LightningModule):
         params = list(self.projections.parameters()) + list(self.regression_head.parameters())
         optimizer = torch.optim.AdamW(params, lr=self.hparams.learning_rate, weight_decay=0.01)
         
-        # Optional: Add scheduler for better convergence
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, 
-            T_max=self.hparams.max_epochs,
-            eta_min=self.hparams.min_lr
+            optimizer, T_max=self.hparams.max_epochs, eta_min=self.hparams.min_lr
         )
         return {
             'optimizer': optimizer,
@@ -1636,22 +1645,20 @@ class RegressionFinetuner2(pl.LightningModule):
 
         model = cls(**finetuner_hparams)
         
-        # Load only the swinViT weights (as in classification)
         src_dict = pretrain_model.encoder.swinViT.state_dict()
         dst_dict = model.encoder.swinViT.state_dict()
         
-        # Keep only matching keys with identical shape
-        filtered = {k: v for k, v in src_dict.items() if k in dst_dict and v.shape == dst_dict[k].shape}
+        filtered_state_dict = {
+            k: v for k, v in src_dict.items() 
+            if k in dst_dict and v.shape == dst_dict[k].shape
+        }
         
-        # Load into finetuner backbone
-        msg = model.encoder.swinViT.load_state_dict(filtered, strict=False)
+        msg = model.encoder.swinViT.load_state_dict(filtered_state_dict, strict=False)
         
-        print(f"✓ Loaded {len(filtered)} swinViT tensors from {checkpoint_path}")
-        print(f"✓ Model configured for {in_channels}-modal input with multi-scale feature fusion.")
-        print(f"   Missing keys: {len(msg.missing_keys)} | Unexpected keys: {len(msg.unexpected_keys)}\n")
+        print(f"\n✓ Loaded {len(filtered_state_dict)} swinViT tensors from {checkpoint_path}")
+        print(f"  Missing keys: {len(msg.missing_keys)} | Unexpected keys: {len(msg.unexpected_keys)}\n")
         
         return model
-
 
 if __name__ == "__main__":
     model = ClassificationFineTuner.load_from_checkpoint(
