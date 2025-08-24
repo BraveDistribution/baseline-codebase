@@ -1,4 +1,5 @@
 from typing import Sequence, Tuple, Dict, Any
+import wandb
 from monai.losses import DiceCELoss
 from monai.metrics import DiceMetric
 
@@ -15,6 +16,7 @@ from torchmetrics import AUROC
 from torchmetrics.classification import BinaryAccuracy
 from torchmetrics.regression import PearsonCorrCoef
 
+import matplotlib.pyplot as plt
 
 
 
@@ -998,8 +1000,9 @@ class SegmentationFineTuner(pl.LightningModule):
             in_channels=in_channels,
             out_channels=num_classes,
             feature_size=feature_size,
-            use_checkpoint=True,
+            use_checkpoint=False,
             use_v2=True,
+            normalize=False,
         )
 
         self.loss_function = DiceCELoss(to_onehot_y=True, softmax=True)
@@ -1190,12 +1193,7 @@ class SegmentationFineTuner(pl.LightningModule):
 
     def configure_optimizers(self):
         """Configure optimizer and learning rate scheduler."""
-        if self.freeze_encoder:
-            decoder_params = [p for name, p in self.encoder.named_parameters() if not name.startswith('swinViT.') and p.requires_grad]
-            params = decoder_params
-            print(f"Optimizing {len(params)} decoder parameters.")
-        else:
-            params = self.parameters()
+        params = self.parameters()
 
         optimizer = torch.optim.AdamW(params, lr=self.learning_rate, weight_decay=0.01)
 
@@ -1240,96 +1238,202 @@ from torch.optim.lr_scheduler import LambdaLR
 # Assume ContrastiveTransformer class from your previous code is available
 # from your_pretrain_module import ContrastiveTransformer
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import pytorch_lightning as pl
+import math
+from typing import Tuple
 
+# === Assume these are your project's specific imports ===
+# from monai.networks.nets import SwinUNETR
+# from torchmetrics.classification import AUROC, BinaryAccuracy
+# from your_project.models import ContrastiveTransformer
+# ==========================================================
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import pytorch_lightning as pl
+import math
+from typing import Tuple
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import pytorch_lightning as pl
+from typing import Tuple
+
+# Assuming these imports from your project
+from monai.networks.nets import SwinUNETR
+from torchmetrics.classification import BinaryAccuracy, AUROC
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import pytorch_lightning as pl
+from typing import Tuple
+
+# --- Make sure your imports are correct ---
+from monai.networks.nets import SwinUNETR
+from torchmetrics.classification import BinaryAccuracy, AUROC
 class ClassificationFinetuner2(pl.LightningModule):
-    """
-    Implements multi-modal fine-tuning using feature-level fusion.
-
-    Each modality is passed through the frozen 1-channel encoder independently.
-    The resulting feature vectors are then concatenated before being fed into
-    a trainable classification head.
-    """
     def __init__(
         self,
-        num_classes: int,
-        in_channels: int, # Expected number of modalities, e.g., 3
-        img_size: Tuple[int, int, int] = (96, 96, 96),
+        in_channels: int,
         feature_size: int = 24,
-        learning_rate: float = 1e-5,
-        freeze_encoder: bool = True,
-        dropout_rate: float = 0.3,
-        warmup_epochs: int = 5,
-        max_epochs: int = 100,
-        min_lr: float = 1e-6,
+        img_size: Tuple[int, int, int] = (96, 96, 96),
+        learning_rate: float = 1e-4,
+        weight_decay: float = 0.01,
         **kwargs,
     ):
         super().__init__()
         self.save_hyperparameters()
 
-        # The encoder is always initialized with in_channels=1,
-        # as it processes each modality individually.
+        # Frozen encoder
         self.encoder = SwinUNETR(
             in_channels=1,
-            out_channels=1, # Not used for feature extraction
-            feature_size=self.hparams.feature_size,
-            use_checkpoint=True,
+            out_channels=1,
+            feature_size=feature_size,
             use_v2=True,
         )
-
-        # Get the output dimension from the 1-channel encoder
+        
+        # Determine dimensions for each layer output
         with torch.no_grad():
-            dummy_input = torch.zeros(1, 1, *self.hparams.img_size)
-            features = self.encoder.swinViT(dummy_input)[-1]
-            self.encoder_dim = features.shape[1]
+            dummy = torch.zeros(1, 1, *img_size)
+            all_features = self.encoder.swinViT(dummy)
+            # Typically: [48, 96, 192, 384, 768] channels for different layers
+            feature_dims = [f.shape[1] for f in all_features]
+        
+        # Separate pooling for each scale
+        self.pools = nn.ModuleList([
+            nn.AdaptiveAvgPool3d(1) for _ in range(5)
+        ])
+        
+        # Projection to common dimension for each scale
+        common_dim = 64
 
-        # This part of the classifier extracts features from the encoder's output maps
-        self.feature_pool = nn.Sequential(
-            nn.AdaptiveAvgPool3d(1),
-            nn.Flatten()
-        )
+        self.projections = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(dim, common_dim),
+                nn.LayerNorm(common_dim),  # Works with ANY batch size
+                nn.ReLU()
+            ) for dim in feature_dims
+        ])
 
-        # The classification head is adapted to accept the concatenated features
-        # from all input channels (modalities).
-        self.classification_head = nn.Sequential(
-            nn.Linear(self.encoder_dim * self.hparams.in_channels, 64),
+        self.classifier_head = nn.Sequential(
+            nn.Linear(in_channels * 5 * common_dim, 128),
+            nn.LayerNorm(128),  # Instead of BatchNorm1d
             nn.ReLU(),
-            nn.Dropout(self.hparams.dropout_rate),
-            nn.Linear(64, self.hparams.num_classes)
+            nn.Dropout(0.3),
+            nn.Linear(128, 1)
         )
-
-        if self.hparams.freeze_encoder:
-            self._freeze_encoder()
-
+        
+        self._freeze_encoder()
+        
         # Metrics
-        self.train_acc = BinaryAccuracy()
         self.val_acc = BinaryAccuracy()
-        self.test_acc = BinaryAccuracy()
-        self.train_auroc = AUROC(task="binary")
         self.val_auroc = AUROC(task="binary")
-        self.test_auroc = AUROC(task="binary")
+
+    def forward(self, x):
+        B, C = x.shape[0], x.shape[1]
+        x_reshaped = x.view(B * C, 1, *x.shape[2:])
+        
+        # Get ALL layer features
+        all_features = self.encoder.swinViT(x_reshaped)  # List of 5 feature maps
+        
+        # Pool and project each scale
+        pooled_features = []
+        for i, features in enumerate(all_features):
+            pooled = self.pools[i](features)  # [B*C, dim, 1, 1, 1]
+            pooled = pooled.view(B * C, -1)   # [B*C, dim]
+            projected = self.projections[i](pooled)  # [B*C, 64]
+            pooled_features.append(projected)
+        
+        # Concatenate all scales
+        multi_scale = torch.cat(pooled_features, dim=1)  # [B*C, 5*64]
+        multi_scale = multi_scale.view(B, C * 5 * 64)    # [B, C*5*64]
+        
+        # Classify
+        logits = self.classifier_head(multi_scale)
+        return logits.squeeze(-1)
 
     def _freeze_encoder(self):
-        """Freeze encoder weights"""
-        print("Freezing encoder weights.")
-        for param in self.encoder.parameters():
-            param.requires_grad = False
+        for p in self.encoder.parameters():
+            p.requires_grad = False
+        self.encoder.eval()
+    def training_step(self, batch, batch_idx):
+        # This part remains the same
+        images, labels = batch['image'], batch['label'].float()
+        logits = self(images)
+        labels = labels.view(-1).float().to(logits.device)
+        # print("logits:", logits.shape, "labels:", labels.shape)
+
+        # print("logits:", logits)
+        loss = F.binary_cross_entropy_with_logits(logits, labels)
+        self.log('train_loss', loss, prog_bar=True)
+        return loss
+
+    def on_after_backward(self):
+        # grads exist now
+        g = [p.grad is not None and torch.isfinite(p.grad).all() for p in self.classifier_head.parameters()]
+        self.log("dbg/cls_head_has_grads", float(all(g)), prog_bar=True)
+
+    def validation_step(self, batch, batch_idx):
+        images, labels = batch['image'], batch['label'].float()
+        
+        logits = self(images)
+        labels = labels.view(-1).float().to(logits.device)
+        loss = F.binary_cross_entropy_with_logits(logits, labels.float())
+        probs = torch.sigmoid(logits)
+        self.val_acc.update(probs, labels)
+        self.val_auroc.update(probs, labels)
+        self.log_dict({'val/loss': loss, 'val_acc': self.val_acc, 'val_auroc': self.val_auroc}, on_epoch=True, prog_bar=True)
+
+
+    def configure_optimizers(self):
+        trainable_params = list(self.projections.parameters()) + \
+                        list(self.classifier_head.parameters())
+        
+        optimizer = torch.optim.AdamW(
+            trainable_params,
+            lr=self.hparams.learning_rate,
+            weight_decay=self.hparams.weight_decay
+        )
+        
+        # Restarts every 50 epochs, with increasing periods
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=50,  # First restart after 50 epochs
+            T_mult=2,  # Double the period after each restart (50, 100, 150)
+            eta_min=1e-7
+        )
+        
+        return {
+            'optimizer': optimizer,
+            'lr_scheduler': {
+                'scheduler': scheduler,
+                'interval': 'epoch',
+                'frequency': 1
+            }
+        }
+
 
     @classmethod
     def load_from_pretrained(
         cls,
         checkpoint_path: str,
         num_classes: int,
-        in_channels: int, # Number of modalities for fine-tuning
+        in_channels: int,
         **kwargs
     ):
         """
-        Loads the encoder from a ContrastiveTransformer checkpoint and initializes
-        this ClassificationFinetuner2 model for feature-fusion.
+        Loads only the SwinViT backbone weights from a ContrastiveTransformer checkpoint.
         """
         if not num_classes:
             raise ValueError("num_classes must be specified for fine-tuning.")
 
-        # Load the pre-trained model to get its hparams and state_dict
+        # Load pretrained ContrastiveTransformer
         pretrain_model = ContrastiveTransformer.load_from_checkpoint(checkpoint_path)
 
         finetuner_hparams = pretrain_model.hparams
@@ -1337,120 +1441,30 @@ class ClassificationFinetuner2(pl.LightningModule):
         finetuner_hparams['num_classes'] = num_classes
         finetuner_hparams['in_channels'] = in_channels
 
+        # Create finetuner with fresh weights
         model = cls(**finetuner_hparams)
-        
-        # Copy the pre-trained encoder weights
-        model.encoder.load_state_dict(pretrain_model.encoder.state_dict())
-        print(f"✓ Loaded 1-channel encoder weights from {checkpoint_path}")
-        print(f"✓ Model configured for {in_channels}-modal input with feature fusion.")
-            
+
+        # --- Extract just swinViT weights ---
+        src_dict = pretrain_model.encoder.swinViT.state_dict()
+        dst_dict = model.encoder.swinViT.state_dict()
+
+        # Keep only matching keys with identical shape
+        filtered = {k: v for k, v in src_dict.items() if k in dst_dict and v.shape == dst_dict[k].shape}
+
+        # Load into finetuner backbone
+        msg = model.encoder.swinViT.load_state_dict(filtered, strict=False)
+
+        print(f"\n✓ Loaded {len(filtered)} swinViT tensors from {checkpoint_path}")
+        print(f"   Missing keys: {len(msg.missing_keys)} | Unexpected keys: {len(msg.unexpected_keys)}\n")
+
         return model
 
-    def forward(self, x):
-        # x has shape (B, C, D, H, W), where B=batch_size, C=in_channels
-        batch_size, num_channels = x.shape[0], x.shape[1]
 
-        # Reshape to (B * C, 1, D, H, W) to pass all modalities through the
-        # 1-channel encoder in a single, efficient batch.
-        x_reshaped = x.view(batch_size * num_channels, 1, *x.shape[2:])
-
-        # 1. Get feature maps from the frozen encoder for each modality
-        features = self.encoder.swinViT(x_reshaped)[-1]
-
-        # 2. Pool and flatten features
-        flat_features = self.feature_pool(features) # Shape: (B * C, encoder_dim)
-
-        # 3. Concatenate the features from the different modalities
-        # Reshape from (B * C, encoder_dim) to (B, C * encoder_dim)
-        combined_features = flat_features.view(batch_size, num_channels * self.encoder_dim)
-
-        # 4. Pass the combined feature vector to the trainable classification head
-        logits = self.classification_head(combined_features)
-        return logits
-
-    def training_step(self, batch, batch_idx):
-        images, labels = batch['image'], batch['label'].long()
-        
-        # Correctly squeeze the last dimension only
-        logits = self(images).squeeze(dim=1)
-        
-        loss = F.binary_cross_entropy_with_logits(logits, labels.float())
-        
-        # Update metrics with raw logits or probs
-        probs = torch.sigmoid(logits)
-        self.train_acc.update(probs, labels)
-        self.train_auroc.update(probs, labels)
-
-        self.log_dict({
-            'train/loss': loss,
-            'train/acc': self.train_acc,
-            'train/auroc': self.train_auroc,
-        }, on_step=False, on_epoch=True, prog_bar=True)
-        
-        return loss
-
-
-    def validation_step(self, batch, batch_idx):
-        images, labels = batch['image'], batch['label'].long()
-        
-        logits = self(images).squeeze(dim=1)
-        loss = F.binary_cross_entropy_with_logits(logits, labels.float())
-        
-        probs = torch.sigmoid(logits)
-        self.val_acc.update(probs, labels)
-        self.val_auroc.update(probs, labels)
-
-        self.log_dict({
-            'val/loss': loss,
-            'val/acc': self.val_acc,
-            'val/auroc': self.val_auroc,
-        }, prog_bar=True, on_epoch=True)
-
-    def configure_optimizers(self):
-        # Select parameters to optimize
-        if self.hparams.freeze_encoder:
-            params = self.classification_head.parameters()
-            print("Optimizing classification_head parameters only.")
-        else:
-            params = self.parameters()
-            print("Optimizing all model parameters.")
-        
-        optimizer = torch.optim.AdamW(
-            params, lr=self.hparams.learning_rate, weight_decay=0.01
-        )
-        
-        # Learning rate scheduler
-        def lr_lambda(current_step: int):
-            if self.trainer.estimated_stepping_batches is not None:
-                num_training_steps = self.trainer.estimated_stepping_batches
-                num_warmup_steps = (self.hparams.warmup_epochs * num_training_steps) // self.hparams.max_epochs
-            else: # Fallback for sanity checks
-                num_training_steps = self.hparams.max_epochs
-                num_warmup_steps = self.hparams.warmup_epochs
-
-            if current_step < num_warmup_steps:
-                return float(current_step) / float(max(1, num_warmup_steps))
-            progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
-            cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
-            decayed = (1 - self.hparams.min_lr / self.hparams.learning_rate) * cosine_decay + self.hparams.min_lr / self.hparams.learning_rate
-            return decayed
-
-        scheduler = LambdaLR(optimizer, lr_lambda)
-        
-        return {
-            'optimizer': optimizer,
-            'lr_scheduler': {'scheduler': scheduler, 'interval': 'step', 'frequency': 1}
-        }
-        
-        
 
 class RegressionFinetuner2(pl.LightningModule):
     """
-    Implements multi-modal regression using feature-level fusion.
-
-    Each modality is passed through a frozen 1-channel encoder independently.
-    The resulting feature vectors are concatenated before being fed into
-    a trainable regression head.
+    Implements multi-modal regression using multi-scale feature fusion.
+    Uses features from all layers of the encoder, not just the last one.
     """
     def __init__(
         self,
@@ -1479,16 +1493,33 @@ class RegressionFinetuner2(pl.LightningModule):
             use_v2=True,
         )
 
+        # Determine dimensions for each layer output
         with torch.no_grad():
-            dummy_input = torch.zeros(1, 1, *self.hparams.img_size)
-            features = self.encoder.swinViT(dummy_input)[-1]
-            self.encoder_dim = features.shape[1]
+            dummy = torch.zeros(1, 1, *img_size)
+            all_features = self.encoder.swinViT(dummy)
+            # Get dimensions for all 5 layers
+            self.feature_dims = [f.shape[1] for f in all_features]
+        
+        # Separate pooling for each scale
+        self.pools = nn.ModuleList([
+            nn.AdaptiveAvgPool3d(1) for _ in range(5)
+        ])
+        
+        # Projection to common dimension for each scale
+        common_dim = 32  # Smaller for regression with limited data
+        self.projections = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(dim, common_dim),
+                nn.LayerNorm(common_dim),  # Batch-size independent
+                nn.ReLU(),
+                nn.Dropout(dropout_rate * 0.5)  # Light dropout in projections
+            ) for dim in self.feature_dims
+        ])
 
-        self.feature_pool = nn.Sequential(nn.AdaptiveAvgPool3d(1), nn.Flatten())
-
-        # Regression head accepts concatenated features
+        # Regression head accepts concatenated multi-scale features
         self.regression_head = nn.Sequential(
-            nn.Linear(self.encoder_dim * self.hparams.in_channels, 64),
+            nn.Linear(in_channels * 5 * common_dim, 64),  # 5 scales × 32 dims × C modalities
+            nn.LayerNorm(64),  # Instead of BatchNorm
             nn.ReLU(),
             nn.Dropout(self.hparams.dropout_rate),
             nn.Linear(64, 1),
@@ -1498,47 +1529,38 @@ class RegressionFinetuner2(pl.LightningModule):
             self._freeze_encoder()
         
         self.val_corr = PearsonCorrCoef()
-
-            
-        # For tracking validation predictions
         self.val_predictions = []
         self.val_targets = []
 
     def _freeze_encoder(self):
-        print("Freezing encoder weights.")
+        """Freeze all encoder weights and set to evaluation mode."""
+        print("Freezing encoder weights and setting to .eval().")
         for param in self.encoder.parameters():
             param.requires_grad = False
-
-    @classmethod
-    def load_from_pretrained(
-        cls,
-        checkpoint_path: str,
-        in_channels: int,
-        **kwargs
-    ):
-        pretrain_model = ContrastiveTransformer.load_from_checkpoint(checkpoint_path)
-        finetuner_hparams = pretrain_model.hparams
-        finetuner_hparams.update(kwargs)
-        finetuner_hparams['in_channels'] = in_channels
-
-        model = cls(**finetuner_hparams)
-        model.encoder.load_state_dict(pretrain_model.encoder.state_dict())
-        
-        print(f"✓ Loaded 1-channel encoder weights from {checkpoint_path}")
-        print(f"✓ Model configured for {in_channels}-modal input with feature fusion.")
-        return model
+        self.encoder.eval()
 
     def forward(self, x):
-        batch_size, num_channels = x.shape[0], x.shape[1]
-        x_reshaped = x.view(batch_size * num_channels, 1, *x.shape[2:])
-
-        features = self.encoder.swinViT(x_reshaped)[-1]
-        flat_features = self.feature_pool(features)
+        B, C = x.shape[0], x.shape[1]
+        x_reshaped = x.view(B * C, 1, *x.shape[2:])
         
-        combined_features = flat_features.view(batch_size, num_channels * self.encoder_dim)
+        # Get ALL layer features (not just the last one)
+        all_features = self.encoder.swinViT(x_reshaped)  # List of 5 feature maps
         
-        output = self.regression_head(combined_features)
-        return output # Return shape: [batch_size]
+        # Pool and project each scale
+        pooled_features = []
+        for i, features in enumerate(all_features):
+            pooled = self.pools[i](features)  # [B*C, dim, 1, 1, 1]
+            pooled = pooled.view(B * C, -1)   # [B*C, dim]
+            projected = self.projections[i](pooled)  # [B*C, 32]
+            pooled_features.append(projected)
+        
+        # Concatenate all scales
+        multi_scale = torch.cat(pooled_features, dim=1)  # [B*C, 5*32]
+        multi_scale = multi_scale.view(B, C * 5 * 32)    # [B, C*5*32]
+        
+        # Regress
+        output = self.regression_head(multi_scale)
+        return output.squeeze(-1)  # Return shape: [batch_size]
 
     def compute_loss(self, pred, target):
         loss_type = self.hparams.loss_type
@@ -1556,6 +1578,7 @@ class RegressionFinetuner2(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         images, targets = batch['image'], batch['label'].float()
+        targets = targets.view(-1)  # Ensure proper shape
         preds = self(images)
         loss = self.compute_loss(preds, targets)
         
@@ -1565,6 +1588,7 @@ class RegressionFinetuner2(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         images, targets = batch['image'], batch['label'].float()
+        targets = targets.view(-1)  # Ensure proper shape
         preds = self(images)
         loss = self.compute_loss(preds, targets)
         mae = F.l1_loss(preds, targets)
@@ -1576,14 +1600,57 @@ class RegressionFinetuner2(pl.LightningModule):
         self.log_dict({
             'val/loss': loss, 
             'val/mae': mae,
-            'val/correlation': self.val_corr, # Log the object
+            'val/correlation': self.val_corr,
         }, prog_bar=True, on_epoch=True)
 
-
     def configure_optimizers(self):
-        params = self.regression_head.parameters() if self.hparams.freeze_encoder else self.parameters()
+        params = list(self.projections.parameters()) + list(self.regression_head.parameters())
         optimizer = torch.optim.AdamW(params, lr=self.hparams.learning_rate, weight_decay=0.01)
-        return optimizer
+        
+        # Optional: Add scheduler for better convergence
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, 
+            T_max=self.hparams.max_epochs,
+            eta_min=self.hparams.min_lr
+        )
+        return {
+            'optimizer': optimizer,
+            'lr_scheduler': {
+                'scheduler': scheduler,
+                'interval': 'epoch',
+                'frequency': 1,
+            }
+        }
+
+    @classmethod
+    def load_from_pretrained(
+        cls,
+        checkpoint_path: str,
+        in_channels: int,
+        **kwargs
+    ):
+        pretrain_model = ContrastiveTransformer.load_from_checkpoint(checkpoint_path)
+        finetuner_hparams = pretrain_model.hparams
+        finetuner_hparams.update(kwargs)
+        finetuner_hparams['in_channels'] = in_channels
+
+        model = cls(**finetuner_hparams)
+        
+        # Load only the swinViT weights (as in classification)
+        src_dict = pretrain_model.encoder.swinViT.state_dict()
+        dst_dict = model.encoder.swinViT.state_dict()
+        
+        # Keep only matching keys with identical shape
+        filtered = {k: v for k, v in src_dict.items() if k in dst_dict and v.shape == dst_dict[k].shape}
+        
+        # Load into finetuner backbone
+        msg = model.encoder.swinViT.load_state_dict(filtered, strict=False)
+        
+        print(f"✓ Loaded {len(filtered)} swinViT tensors from {checkpoint_path}")
+        print(f"✓ Model configured for {in_channels}-modal input with multi-scale feature fusion.")
+        print(f"   Missing keys: {len(msg.missing_keys)} | Unexpected keys: {len(msg.unexpected_keys)}\n")
+        
+        return model
 
 
 if __name__ == "__main__":

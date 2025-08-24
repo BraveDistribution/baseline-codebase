@@ -65,7 +65,7 @@ def get_finetune_augmentations(patch_size, preset):
 def spatial_augmentation(patch_size):
     return Spatial(
         patch_size=patch_size,
-        crop=False, #Khamyl[Modif]: True,
+        crop=True, #Khamyl[Modif]: True,
         random_crop=False,
         cval="min",
         p_deform_per_sample=0.33,

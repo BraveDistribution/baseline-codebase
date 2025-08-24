@@ -58,10 +58,10 @@ def train(
         filename="best-checkpoint",
         monitor="val/loss",
         mode="min",
-        save_top_k=1,
+        save_top_k=5,
     )
     # aug_params = get_finetune_augmentation_params("all")
-    aug_params = get_finetune_augmentation_params("best_practice_classification")
+    aug_params = get_finetune_augmentation_params("basic")
     task_type_preset = "classification" if task_type == "regression" else task_type
     augmenter = YuccaAugmentationComposer(
         patch_size=[patch_size, patch_size, patch_size],
@@ -114,8 +114,8 @@ def train(
             checkpoint_path=str(model_checkpoint),
             num_classes=1,
             in_channels=num_modalities,
-            freeze_encoder=True,
-            learning_rate=1e-5, # We discussed using a lower LR for fine-tuning
+            freeze_encoder=False,
+            learning_rate=1e-4, # We discussed using a lower LR for fine-tuning
             max_epochs=50
         )
     elif task_type == "regression":
@@ -141,9 +141,12 @@ def train(
         max_epochs=num_epochs,
         callbacks=[checkpoint_callback],
         logger=[wandb_logger],
-        precision="16-mixed",
         accelerator="gpu",
-        limit_train_batches=50,
+        precision='32-true',
+        limit_train_batches=30,
+        accumulate_grad_batches=5,
+        log_every_n_steps=15,
+        
     )
     trainer.fit(model, datamodule=data_module)
 
