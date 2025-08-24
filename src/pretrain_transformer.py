@@ -90,7 +90,10 @@ def train(
         gradient_clip_algorithm='norm',
     )
 
-    trainer.fit(model, datamodule=data_module)
+    if resume_from_checkpoint:
+        trainer.fit(model, datamodule=data_module, ckpt_path=resume_from_checkpoint)
+    else:
+        trainer.fit(model, datamodule=data_module)
 
 if __name__ == '__main__':
     Fire(train)
