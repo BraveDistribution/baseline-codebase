@@ -1,0 +1,750 @@
+#!/usr/bin/env python
+import argparse
+import os
+import pytorch_lightning as pl
+import torch.nn.functional as F
+import torch.nn as nn
+import torch
+from torch.nn.functional import sigmoid
+from typing import List, Dict, Any, Tuple, Sequence
+from monai.networks.nets.swin_unetr import SwinUNETR
+import math
+import nibabel as nib
+
+from yucca.functional.preprocessing import (
+    preprocess_case_for_inference,
+    reverse_preprocessing,
+)
+
+from torchmetrics.regression import PearsonCorrCoef
+
+def generate_random_mask(
+    x: torch.Tensor,
+    mask_ratio: float,
+    patch_size: int,
+    out_type: type = int,
+):
+    # assumes x is (B, C, H, W) or (B, C, H, W, Z)
+
+    dim = len(x.shape) - 2
+    assert dim in [2, 3]
+
+    # check if all spatial dimensions are divisible by patch_size
+    for i in range(2, len(x.shape)):
+        assert x.shape[i] % patch_size == 0, f"Shape: {x.shape}, Patch size: {patch_size}, Dim {i} not divisible"
+
+    mask = generate_1d_mask(x, mask_ratio, patch_size, out_type)
+    mask = reshape_to_dim(mask, x.shape, patch_size)
+
+    up_mask = upsample_mask(mask, patch_size)
+
+    return up_mask
+
+
+def generate_1d_mask(x: torch.Tensor, mask_ratio: float, patch_size: int, out_type: type):
+    assert x.shape[1] in [1, 3], "Channel dim is not 1 or 3. Are you sure?"
+    assert out_type in [int, bool]
+
+    N = x.shape[0]
+    # Calculate total number of patches by multiplying patches along each spatial dimension
+    L = 1
+    for i in range(2, len(x.shape)):
+        L *= (x.shape[i] // patch_size)
+
+    len_keep = int(L * (1 - mask_ratio))
+
+    noise = torch.randn(N, L, device=x.device)
+
+    # sort noise for each sample
+    ids_shuffle = torch.argsort(noise, dim=1)
+    ids_restore = torch.argsort(ids_shuffle, dim=1)
+
+    # generate the binary mask: 0 is keep 1 is remove
+    mask = torch.ones([N, L], device=x.device)
+    mask[:, :len_keep] = 0
+    # unshuffle to get the binary mask
+    mask = torch.gather(mask, dim=1, index=ids_restore)
+
+    if out_type == bool:
+        mask = mask.bool()  # (B, H * W)
+    elif out_type == int:
+        mask = mask.int()
+
+    return mask  # (B, H * W) 0 or False is keep, 1 or True is remove
+
+
+def reshape_to_dim(mask: torch.Tensor, original_shape: tuple, patch_size: int):
+    dim = len(original_shape) - 2
+    assert dim in [2, 3]
+    assert len(mask.shape) == 2
+
+    if dim == 2:
+        h_patches = original_shape[2] // patch_size
+        w_patches = original_shape[3] // patch_size
+        return mask.reshape(-1, h_patches, w_patches)
+    else:
+        h_patches = original_shape[2] // patch_size
+        w_patches = original_shape[3] // patch_size
+        z_patches = original_shape[4] // patch_size
+        return mask.reshape(-1, h_patches, w_patches, z_patches)
+
+
+def upsample_mask(mask: torch.Tensor, scale: int):
+    assert scale > 0
+    assert len(mask.shape) in [3, 4]  # (B, H, W) or (B, H, W, Z)
+
+    if len(mask.shape) == 3:
+        mask = mask.repeat_interleave(scale, dim=1).repeat_interleave(scale, dim=2)  # (B, H * scale, W * scale)
+    else:
+        # (B, H * scale, W * scale, Z * scale)
+        mask = mask.repeat_interleave(scale, dim=1).repeat_interleave(scale, dim=2).repeat_interleave(scale, dim=3)
+
+    return mask.unsqueeze(1)  # (B, C, H * scale, W * scale) or (B, C, H * scale, W * scale, Z * scale)
+
+
+def random_mask(x, mask_ratio, mask_patch_size, mask_token=0):
+    mask = generate_random_mask(x, mask_ratio, mask_patch_size, out_type=bool)
+    assert isinstance(mask, torch.BoolTensor) or isinstance(
+        mask, torch.cuda.BoolTensor
+    ), mask.type()
+    x[mask] = mask_token
+    return x, mask
+
+class ContrastiveTransformer(pl.LightningModule):
+    def __init__(
+        self,
+        patch_size: Sequence[int] = (4, 4, 4),
+        learning_rate: float = 1e-4,
+        img_size: Tuple[int, int, int] = (96, 96, 96),
+        feature_size: int = 24,
+        mask_ratio: float = 0.6,
+        temperature: float = 0.6,
+        queue_size: int = 4096,
+        momentum: float = 0.996,
+        warmup_epochs: int = 1,
+        max_epochs: int = 30,
+        min_lr: float = 1e-5,
+    ):
+        super().__init__()
+        self.save_hyperparameters()
+
+        self.warmup_epochs = warmup_epochs
+        self.max_epochs = max_epochs
+        self.min_lr = min_lr
+        # Main encoder
+        self.encoder = SwinUNETR(
+            in_channels=1,
+            out_channels=1,
+            feature_size=feature_size,
+            use_checkpoint=True,
+            use_v2=True,
+        )
+
+        # Momentum encoder for MoCo
+        self.encoder_m = SwinUNETR(
+            in_channels=1,
+            out_channels=1,
+            feature_size=feature_size,
+            use_checkpoint=True,
+            use_v2=True,
+        )
+
+        # Initialize momentum encoder
+        for param_q, param_k in zip(self.encoder.parameters(), self.encoder_m.parameters()):
+            param_k.data.copy_(param_q.data)
+            param_k.requires_grad = False
+
+        # Projection head
+        with torch.no_grad():
+            dummy_input = torch.zeros(1, 1, *img_size)
+            features = self.encoder.swinViT(dummy_input)[-1]
+            encoder_dim = features.shape[1]
+
+        self.projection = nn.Sequential(
+            nn.AdaptiveAvgPool3d(1),
+            nn.Flatten(),
+            nn.Linear(encoder_dim, 512),
+            nn.ReLU(),
+            nn.Linear(512, 128),
+        )
+
+        # Momentum projection head
+        self.projection_m = nn.Sequential(
+            nn.AdaptiveAvgPool3d(1),
+            nn.Flatten(),
+            nn.Linear(encoder_dim, 512),
+            nn.ReLU(),
+            nn.Linear(512, 128),
+        )
+
+        # Initialize momentum projection
+        for param_q, param_k in zip(self.projection.parameters(), self.projection_m.parameters()):
+            param_k.data.copy_(param_q.data)
+            param_k.requires_grad = False
+
+        # MoCo queue
+        self.register_buffer("queue", F.normalize(torch.randn(128, queue_size), dim=0))
+        self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
+
+        self.temperature = temperature
+        self.momentum = momentum
+        self.queue_size = queue_size
+        self.mask_ratio = mask_ratio
+        self.learning_rate = learning_rate
+
+    @torch.no_grad()
+    def _momentum_update(self):
+        """Update momentum encoder"""
+        for param_q, param_k in zip(self.encoder.parameters(), self.encoder_m.parameters()):
+            param_k.data = param_k.data * self.momentum + param_q.data * (1. - self.momentum)
+        for param_q, param_k in zip(self.projection.parameters(), self.projection_m.parameters()):
+            param_k.data = param_k.data * self.momentum + param_q.data * (1. - self.momentum)
+
+    @torch.no_grad()
+    def _dequeue_and_enqueue(self, keys):
+        """Update MoCo queue"""
+        if self.trainer is not None and self.trainer.world_size > 1:
+            keys = self._concat_all_gather(keys)
+
+        batch_size = keys.shape[0]
+        ptr = int(self.queue_ptr)
+
+        if ptr + batch_size > self.queue_size:
+            self.queue[:, ptr:] = keys[:self.queue_size - ptr].T
+            self.queue[:, :batch_size - (self.queue_size - ptr)] = keys[self.queue_size - ptr:].T
+            ptr = batch_size - (self.queue_size - ptr)
+        else:
+            self.queue[:, ptr:ptr + batch_size] = keys.T
+            ptr = (ptr + batch_size) % self.queue_size
+
+        self.queue_ptr[0] = ptr
+
+    @torch.no_grad()
+    def _concat_all_gather(self, tensor):
+        """Gather tensors from all processes"""
+        if not torch.distributed.is_initialized():
+            return tensor
+
+        tensors_gather = [torch.zeros_like(tensor) for _ in range(torch.distributed.get_world_size())]
+        torch.distributed.all_gather(tensors_gather, tensor, async_op=False)
+        return torch.cat(tensors_gather, dim=0)
+
+    def forward_encoder(self, x):
+        """Forward through encoder only"""
+        features = self.encoder.swinViT(x)[-1]
+        return features
+
+    def forward_mae(self, x):
+        """MAE forward pass"""
+        masked_x, mask = random_mask(x, self.mask_ratio, 4)
+        reconstruction = self.encoder(masked_x)
+        return reconstruction, mask
+
+    def forward_contrastive(self, x):
+        """Contrastive forward pass"""
+        features = self.forward_encoder(x)
+        z = self.projection(features)
+        return F.normalize(z, dim=1)
+
+    @torch.no_grad()
+    def forward_momentum(self, x):
+        """Forward through momentum encoder"""
+        features = self.encoder_m.swinViT(x)[-1]
+        z = self.projection_m(features)
+        return F.normalize(z, dim=1)
+
+    def contrastive_loss(self, q, k):
+        """InfoNCE loss for MoCo with numerical stability"""
+        # Add small epsilon for stability
+        l_pos = torch.einsum('nc,nc->n', [q, k]).unsqueeze(-1)
+        l_neg = torch.einsum('nc,ck->nk', [q, self.queue.clone().detach()])
+        l_pos = torch.clamp(l_pos, min=-1.0, max=1.0)
+        l_neg = torch.clamp(l_neg, min=-1.0, max=1.0)
+        logits = torch.cat([l_pos, l_neg], dim=1) / self.temperature
+        if torch.isnan(logits).any() or torch.isinf(logits).any():
+            print(f"NaN/Inf detected in logits: {logits}")
+            print(f"l_pos stats: min={l_pos.min()}, max={l_pos.max()}, mean={l_pos.mean()}")
+            print(f"l_neg stats: min={l_neg.min()}, max={l_neg.max()}, mean={l_neg.mean()}")
+
+        labels = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
+        return F.cross_entropy(logits, labels)
+
+
+    def training_step(self, batch, batch_idx):
+        view1 = batch["vol1"]
+        view2 = batch["vol2"]
+
+        # MAE loss
+        recon1, mask1 = self.forward_mae(view1)
+        recon2, mask2 = self.forward_mae(view2)
+        loss_view1 = F.mse_loss(recon1[mask1], view1[mask1])
+        loss_view2 = F.mse_loss(recon2[mask2], view2[mask2])
+        mae_loss = 0.5 * (loss_view1 + loss_view2)
+
+        # Update momentum encoder
+        self._momentum_update()
+
+        # Contrastive loss
+        q1 = self.forward_contrastive(view1)
+        q2 = self.forward_contrastive(view2)
+
+        with torch.no_grad():
+            k1 = self.forward_momentum(view1)
+            k2 = self.forward_momentum(view2)
+
+        # Cross-view contrastive loss
+        loss_12 = self.contrastive_loss(q1, k2)
+        loss_21 = self.contrastive_loss(q2, k1)
+        contrastive_loss = 0.5 * (loss_12 + loss_21)
+
+        # Update queue
+        self._dequeue_and_enqueue(torch.cat([k1, k2]))
+
+        # Total loss
+        total_loss = mae_loss + contrastive_loss
+
+        # Logging
+        self.log_dict({
+            "train/loss": total_loss,
+            "train/mae_loss": mae_loss,
+            "train/contrastive_loss": contrastive_loss,
+        }, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+
+        return total_loss
+
+    def validation_step(self, batch, batch_idx):
+        view1 = batch["vol1"]
+        view2 = batch["vol2"]
+
+        # MAE loss
+        recon1, mask1 = self.forward_mae(view1)
+        recon2, mask2 = self.forward_mae(view2)
+        loss_view1 = F.mse_loss(recon1[mask1], view1[mask1])
+        loss_view2 = F.mse_loss(recon2[mask2], view2[mask2])
+        mae_loss = 0.5 * (loss_view1 + loss_view2)
+
+        # Contrastive loss (no momentum update in validation)
+        q1 = self.forward_contrastive(view1)
+        q2 = self.forward_contrastive(view2)
+        k1 = self.forward_momentum(view1)
+        k2 = self.forward_momentum(view2)
+
+        loss_12 = self.contrastive_loss(q1, k2)
+        loss_21 = self.contrastive_loss(q2, k1)
+        contrastive_loss = 0.5 * (loss_12 + loss_21)
+
+        total_loss = mae_loss + 1.0 * contrastive_loss
+
+        self.log_dict({
+            "val/loss": total_loss,
+            "val/mae_loss": mae_loss,
+            "val/contrastive_loss": contrastive_loss,
+        }, prog_bar=False, on_epoch=True, sync_dist=True)
+
+        return total_loss
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.AdamW(
+            self.parameters(), lr=self.hparams.learning_rate, weight_decay=0.01
+        )
+
+        # Calculate total steps
+        num_training_steps = self.trainer.estimated_stepping_batches
+        num_warmup_steps = int(num_training_steps * self.hparams.warmup_epochs / self.hparams.max_epochs)
+
+        # Warmup scheduler
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=1e-6, end_factor=1.0, total_iters=num_warmup_steps
+        )
+
+        # Cosine decay scheduler
+        cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=(num_training_steps - num_warmup_steps), eta_min=self.hparams.min_lr
+        )
+
+        # Chain them together
+        lr_scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[num_warmup_steps]
+        )
+
+        return {
+            'optimizer': optimizer,
+            'lr_scheduler': {
+                'scheduler': lr_scheduler,
+                'interval': 'step',
+            }
+        }
+
+class RegressionFinetuner2(pl.LightningModule):
+    """
+    Implements multi-modal regression with multi-scale feature fusion.
+    This version has INCREASED CAPACITY in the projection and regression heads
+    to help learn more complex patterns.
+    """
+    def __init__(
+        self,
+        in_channels: int,
+        img_size: Tuple[int, int, int] = (96, 96, 96),
+        feature_size: int = 24,
+        learning_rate: float = 1e-4,
+        freeze_encoder: bool = True,
+        dropout_rate: float = 0.3,
+        max_epochs: int = 100,
+        min_lr: float = 1e-6,
+        loss_type: str = "huber",
+        loss_alpha: float = 0.5,
+        **kwargs,
+    ):
+        super().__init__()
+        self.save_hyperparameters()
+
+        self.register_buffer("target_min", torch.tensor(18.0))
+        self.register_buffer("target_max", torch.tensor(110.0))
+
+        self.encoder = SwinUNETR(
+            in_channels=1,
+            out_channels=1,
+            feature_size=self.hparams.feature_size,
+            use_checkpoint=True,
+            use_v2=True,
+        )
+
+        with torch.no_grad():
+            dummy = torch.zeros(1, 1, *img_size)
+            all_features = self.encoder.swinViT(dummy)
+            self.feature_dims = [f.shape[1] for f in all_features]
+
+        self.pools = nn.ModuleList([
+            nn.AdaptiveAvgPool3d(1) for _ in range(5)
+        ])
+
+        # --- INCREASED CAPACITY 1 ---
+        # Increased common_dim from 32 to 64
+        common_dim = 64
+        self.projections = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(dim, common_dim),
+                nn.LayerNorm(common_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout_rate * 0.5)
+            ) for dim in self.feature_dims
+        ])
+
+        # --- INCREASED CAPACITY 2 ---
+        # Widened and deepened the regression head
+        self.regression_head = nn.Sequential(
+            nn.Linear(in_channels * 5 * common_dim, 128), # Widened from 64
+            nn.LayerNorm(128),
+            nn.ReLU(),
+            nn.Dropout(self.hparams.dropout_rate),
+            nn.Linear(128, 128), # Added a second hidden layer
+            nn.LayerNorm(128),
+            nn.ReLU(),
+            nn.Dropout(self.hparams.dropout_rate),
+            nn.Linear(128, 1),
+            nn.Sigmoid()
+        )
+
+        if self.hparams.freeze_encoder:
+            self._freeze_encoder()
+
+        self.val_corr = PearsonCorrCoef()
+
+    def _freeze_encoder(self):
+        print("Freezing encoder weights and setting to .eval().")
+        for param in self.encoder.parameters():
+            param.requires_grad = False
+        self.encoder.eval()
+
+    def _normalize(self, x: torch.Tensor) -> torch.Tensor:
+        return (x - self.target_min) / (self.target_max - self.target_min)
+
+    def _unnormalize(self, x: torch.Tensor) -> torch.Tensor:
+        return x * (self.target_max - self.target_min) + self.target_min
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C = x.shape[0], x.shape[1]
+        x_reshaped = x.view(B * C, 1, *x.shape[2:])
+
+        all_features = self.encoder.swinViT(x_reshaped)
+
+        pooled_features = []
+        for i, features in enumerate(all_features):
+            pooled = self.pools[i](features)
+            pooled = pooled.view(B * C, -1)
+            projected = self.projections[i](pooled)
+            pooled_features.append(projected)
+
+        # Note: The input dimension to the head changes with common_dim
+        multi_scale = torch.cat(pooled_features, dim=1)
+        multi_scale = multi_scale.view(B, C * 5 * self.projections[0][0].out_features)
+
+        output = self.regression_head(multi_scale)
+        return output.squeeze(-1)
+
+    def compute_loss(self, pred_normalized, target_normalized):
+        loss_type = self.hparams.loss_type
+        if loss_type == "mse":
+            return F.mse_loss(pred_normalized, target_normalized)
+        elif loss_type == "mae":
+            return F.l1_loss(pred_normalized, target_normalized)
+        elif loss_type == "huber":
+            return F.smooth_l1_loss(pred_normalized, target_normalized)
+        elif loss_type == "combined":
+            mse = F.mse_loss(pred_normalized, target_normalized)
+            mae = F.l1_loss(pred_normalized, target_normalized)
+            return self.hparams.loss_alpha * mse + (1 - self.hparams.loss_alpha) * mae
+        raise ValueError(f"Unknown loss type: {loss_type}")
+
+    def training_step(self, batch, batch_idx):
+        images, targets_original = batch['image'], batch['label'].float()
+        targets_original = targets_original.view(-1)
+
+        targets_normalized = self._normalize(targets_original)
+        preds_normalized = self(images)
+        loss = self.compute_loss(preds_normalized, targets_normalized)
+
+        mae_original = F.l1_loss(self._unnormalize(preds_normalized.detach()), targets_original)
+
+        self.log_dict({'train/loss': loss, 'train/mae_original': mae_original}, prog_bar=True, on_step=True, on_epoch=True)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        images, targets_original = batch['image'], batch['label'].float()
+        targets_original = targets_original.view(-1)
+
+        preds_normalized = self(images)
+        targets_normalized = self._normalize(targets_original)
+        loss = self.compute_loss(preds_normalized, targets_normalized)
+
+        preds_original = self._unnormalize(preds_normalized.detach())
+
+        mae_original = F.l1_loss(preds_original, targets_original)
+        self.val_corr.update(preds_original, targets_original)
+
+        self.log_dict({
+            'val/loss': loss,
+            'val/mae_original': mae_original,
+            'val/correlation': self.val_corr,
+        }, prog_bar=True, on_epoch=True)
+
+    def configure_optimizers(self):
+        params = list(self.projections.parameters()) + list(self.regression_head.parameters())
+        optimizer = torch.optim.AdamW(params, lr=self.hparams.learning_rate, weight_decay=0.01)
+
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=self.hparams.max_epochs, eta_min=self.hparams.min_lr
+        )
+        return {
+            'optimizer': optimizer,
+            'lr_scheduler': {
+                'scheduler': scheduler,
+                'interval': 'epoch',
+                'frequency': 1,
+            }
+        }
+
+    @classmethod
+    def load_from_pretrained(
+        cls,
+        checkpoint_path: str,
+        in_channels: int,
+        **kwargs
+    ):
+        pretrain_model = ContrastiveTransformer.load_from_checkpoint(checkpoint_path)
+        finetuner_hparams = pretrain_model.hparams
+        finetuner_hparams.update(kwargs)
+        finetuner_hparams['in_channels'] = in_channels
+
+        model = cls(**finetuner_hparams)
+
+        src_dict = pretrain_model.encoder.swinViT.state_dict()
+        dst_dict = model.encoder.swinViT.state_dict()
+
+        filtered_state_dict = {
+            k: v for k, v in src_dict.items()
+            if k in dst_dict and v.shape == dst_dict[k].shape
+        }
+
+        msg = model.encoder.swinViT.load_state_dict(filtered_state_dict, strict=False)
+
+        print(f"\n✓ Loaded {len(filtered_state_dict)} swinViT tensors from {checkpoint_path}")
+        print(f"  Missing keys: {len(msg.missing_keys)} | Unexpected keys: {len(msg.unexpected_keys)}\n")
+
+        return model
+
+def unnormalize(x: torch.Tensor) -> torch.Tensor:
+        return x * (torch.tensor(110.0) - torch.tensor(18.0)) + torch.tensor(18.0)
+
+def load_modalities(modality_paths: List[str]) -> List[nib.Nifti1Image]:
+    """Load modality images from provided paths."""
+    images = []
+    for path in modality_paths:
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Modality file not found: {path}")
+        try:
+            img = nib.load(path)
+            images.append(img)
+        except Exception as e:
+            raise RuntimeError(f"Failed to load image {path}: {str(e)}")
+
+    return images
+
+def save_output_txt(number: float | int, output_path: str):
+    """Save a number (float or int) as plain text to a file."""
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+
+    if not output_path.endswith(".txt"):
+        output_path = output_path + ".txt"
+
+    with open(output_path, "w") as f:
+        f.write(f"{number}")
+
+def predict_from_config(
+    modality_paths: List[str],
+    predict_config: Dict[str, Any],
+    reverse_preprocess: bool = False,
+):
+    """
+    Run inference on input modality images using a task-specific configuration.
+
+    Args:
+        modality_paths: Paths to input modality images
+        predict_config: Dictionary containing all the configuration parameters for prediction
+
+    Returns:
+        str: Path to saved prediction
+    """
+    # Load input images
+    images = load_modalities(modality_paths)
+
+    # Extract configuration parameters
+    task_type = predict_config["task_type"]
+    crop_to_nonzero = predict_config["crop_to_nonzero"]
+    norm_op = predict_config["norm_op"]
+    num_classes = predict_config["num_classes"]
+    keep_aspect_ratio = predict_config.get("keep_aspect_ratio", True)
+    patch_size = predict_config["patch_size"]
+    model_path = predict_config["model_path"]
+
+    # Define preprocessing parameters
+    normalization_scheme = [norm_op] * len(modality_paths)
+    target_spacing = [1.0, 1.0, 1.0]  # Isotropic 1mm spacing
+    target_orientation = "RAS"
+
+    # Apply preprocessing
+    case_preprocessed, case_properties = preprocess_case_for_inference(
+        crop_to_nonzero=crop_to_nonzero,
+        images=images,
+        intensities=None,  # Use default intensity normalization
+        normalization_scheme=normalization_scheme,
+        patch_size=patch_size,
+        target_size=None,  # We use target_spacing instead
+        target_spacing=target_spacing,
+        target_orientation=target_orientation,
+        allow_missing_modalities=False,
+        keep_aspect_ratio=keep_aspect_ratio,
+        transpose_forward=[0, 1, 2],  # Standard transpose order
+    )
+
+    # Load the model checkpoint directly with Lightning
+
+    model = RegressionFinetuner2.load_from_checkpoint(
+            checkpoint_path=str(model_path),
+            in_channels=2,
+            freeze_encoder=True,
+            learning_rate=1e-4,
+            max_epochs=50,
+            strict=False
+        )
+
+    # Set model to evaluation mode
+    model.eval()
+
+    # Get device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    case_preprocessed = case_preprocessed.to(device)
+
+    # Run inference
+    with torch.no_grad():
+        # Set up sliding window parameters
+
+        # Get prediction
+        predictions = model(case_preprocessed)
+
+    if reverse_preprocess:
+        predictions_original, _ = reverse_preprocessing(
+            crop_to_nonzero=crop_to_nonzero,
+            images=predictions,
+            image_properties=case_properties,
+            n_classes=num_classes,
+            transpose_forward=[0, 1, 2],
+            transpose_backward=[0, 1, 2],
+        )
+        print(f"-- Prediction shape: {predictions_original.shape}")
+        return predictions_original, images[0].affine
+    else:
+        print(f"-- Prediction shape: {predictions.shape}")
+        return predictions, None
+
+task3_config = {
+    "task_name": "Task003_FOMO3",
+    "crop_to_nonzero": True,
+    "deep_supervision": False,
+    "modalities": ("T1", "T2"),
+    "norm_op": "volume_wise_znorm",
+    "num_classes": 1,  # For regression, output dimension is 1
+    "keep_aspect_ratio": True,
+    "task_type": "regression",
+    "label_extension": ".txt",
+    "labels": {"regression": "Age"},  # Define as regression task
+    "target_spacing": [1.0, 1.0, 1.0],
+    "target_orientation": "RAS",
+}
+
+# Task-specific hardcoded configuration
+predict_config = {
+    # Import values from task_configs
+    **task3_config,
+    # Add inference-specific configs
+    "model_path": "/app/weights/brano_regression_new.ckpt",  # Path to model (inside container!)
+    "patch_size": (96, 96, 96),  # Patch size for inference
+}
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Run inference on FOMO Task 1 (Infarct Detection)"
+    )
+
+    # Input and output paths using modality names from task config
+    parser.add_argument(
+        "--t1", type=str, required=True, help="Path to T1 image (NIfTI format)"
+    )
+    parser.add_argument(
+        "--t2", type=str, required=True, help="Path to T2 image (NIfTI format)"
+    )
+    parser.add_argument(
+        "--output", type=str, required=True, help="Output path for prediction"
+    )
+
+    # Parse arguments
+    args = parser.parse_args()
+
+    modality_paths = [args.t1, args.t2]
+    output_path = args.output
+
+    # Run prediction using the shared prediction logic
+    predictions_original, _ = predict_from_config(
+        modality_paths=modality_paths,
+        predict_config=predict_config,
+    )
+
+
+    save_output_txt(int(unnormalize(predictions_original)), output_path)
+
+
+if __name__ == "__main__":
+    main()
