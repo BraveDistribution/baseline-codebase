@@ -60,11 +60,9 @@ class FOMODataset(Dataset):
             "label": label,
         }
 
-        # logging.info('LOADING CASE: %s', case)
-        # logging.info(data.shape)
-
         metadata = {"foreground_locations": []}
-        return self._transform(data_dict, metadata)
+        transformer_data = self._transform(data_dict, metadata)
+        return transformer_data
 
     def _transform(self, data_dict, metadata=None):
         # Pad the image and label to ensure the entire volume is included
@@ -103,7 +101,192 @@ class FOMODataset(Dataset):
             vol = np.load(file, allow_pickle=True)
 
         return vol
+    
+    @property
+    def labels(self):
+        """
+        Returns a cached list of all labels in the dataset.
+        This will iterate through all files and load the labels once.
+        """
+        if not hasattr(self, '_labels_cache'):
+            print("Caching all labels for weighted sampler... (this may take a moment the first time)")
+            
+            # This is the loop that reads every .txt file to get the labels
+            self._labels_cache = [self._load_label(case) for case in self.all_files]
+            
+            # For regression, _load_label returns a numpy array, so we extract the number
+            if self.task_type == 'regression':
+                self._labels_cache = [label.item() for label in self._labels_cache]
+                
+        return self._labels_cache
 
+class HierarchicalDataset(Dataset):
+    """
+    Dataset class for hierarchical multi-resolution downstream tasks.
+    Returns both local (high resolution) and global (low resolution) views of the same image.
+    Supports classification and regression tasks.
+    """
+
+    def __init__(
+        self,
+        samples: list,
+        patch_size: Tuple[int, int, int],
+        local_data_dir: str = "/home/mg873uh/Projects_kb/data/finetuning_preproc/",
+        global_data_dir: str = "/home/mg873uh/Projects_kb/data/finetuning_preproc/Unified_2.6667mm_float16",
+        composed_transforms: Optional[torchvision.transforms.Compose] = None,
+        task_type: Literal["classification", "regression"] = "classification",
+        allow_missing_modalities: Optional[bool] = False,  # For compatibility
+        p_oversample_foreground: Optional[float] = None,  # For compatibility
+    ):
+        super().__init__()
+        # Support only non-segmentation tasks
+        assert task_type in [
+            "classification",
+            "regression",
+        ], f"Unsupported task type: {task_type}. For segmentation use YuccaTrainDataset instead."
+
+        self.task_type = task_type
+        self.all_files = samples
+        self.composed_transforms = composed_transforms
+        self.patch_size = patch_size
+        self.local_data_dir = local_data_dir
+        self.global_data_dir = global_data_dir
+
+        # Extract task name and validate pivot directory
+        self._validate_and_extract_task_info()
+
+        self.croppad = CropPad(patch_size=self.patch_size)
+        self.to_torch = NumpyToTorch()
+
+    def _validate_and_extract_task_info(self):
+        """
+        Extract task name from samples and validate that the pivot directory
+        matches either local_data_dir or global_data_dir.
+        """
+        if not self.all_files:
+            raise ValueError("No samples provided to HierarchicalDataset")
+
+        # Get the first sample to extract task info
+        first_sample = self.all_files[0]
+
+        # Extract directory parts - samples come as full paths from YuccaDataModule
+        # e.g., '/home/mg873uh/Projects_kb/data/finetuning_preproc/Task001_FOMO1/FOMO1_sub_1'
+        sample_dir = os.path.dirname(first_sample)
+
+        # Find task name pattern (Task###_FOMO#)
+        parts = sample_dir.split(os.sep)
+        task_name = None
+        for part in parts:
+            if part.startswith('Task') and 'FOMO' in part:
+                task_name = part
+                break
+
+        if task_name is None:
+            raise ValueError(f"Could not extract task name from sample path: {first_sample}")
+
+        # Extract pivot directory by removing task name from sample directory
+        task_idx = parts.index(task_name)
+        pivot_parts = parts[:task_idx]
+        pivot_dir = os.sep.join(pivot_parts)
+
+        # Normalize paths for comparison
+        pivot_dir = os.path.normpath(pivot_dir)
+        local_data_dir = os.path.normpath(self.local_data_dir)
+        global_data_dir = os.path.normpath(self.global_data_dir)
+
+        # Check if pivot_dir matches either local_data_dir or global_data_dir
+        if pivot_dir != local_data_dir and pivot_dir != global_data_dir:
+            raise ValueError(
+                f"Pivot directory '{pivot_dir}' does not match either "
+                f"local_data_dir '{local_data_dir}' or global_data_dir '{global_data_dir}'"
+            )
+
+        self.task_name = task_name
+        self.pivot_dir = pivot_dir
+
+    def __len__(self):
+        return len(self.all_files)
+
+    def __getitem__(self, idx):
+        case_full_path = self.all_files[idx]
+
+        # single modality
+        assert isinstance(case_full_path, str)
+
+        # Extract just the basename for the case (e.g., 'FOMO1_sub_1' from full path)
+        case = os.path.basename(case_full_path)
+
+        # Load both local (high-res) and global (low-res) data
+        local_data = self._load_volume(case, self.local_data_dir)
+        global_data = self._load_volume(case, self.global_data_dir)
+        label = self._load_label(case, self.local_data_dir)  # Labels from local dir
+
+        # Create separate data dictionaries for local and global
+        local_data_dict = {
+            "file_path": case_full_path,  # Keep full path for debugging
+            "image": local_data,
+            "label": label,
+        }
+
+        global_data_dict = {
+            "file_path": case_full_path,  # Keep full path for debugging
+            "image": global_data,
+            "label": label,
+        }
+
+        metadata = {"foreground_locations": []}
+
+        # Transform both local and global data with the same transforms
+        local_transformed = self._transform(local_data_dict, metadata)
+        global_transformed = self._transform(global_data_dict, metadata)
+
+        # Return dictionary with both local and global views
+        return {
+            "local": local_transformed["image"],
+            "global": global_transformed["image"],
+            "label": label,
+            "file_path": case_full_path,  # Keep full path for debugging
+        }
+
+    def _transform(self, data_dict, metadata=None):
+        # Pad the image and label to ensure the entire volume is included
+        label = data_dict["label"]
+        data_dict["label"] = None
+        data_dict = self.croppad(data_dict, metadata)
+
+        if self.composed_transforms is not None:
+            data_dict = self.composed_transforms(data_dict)
+
+        data_dict["label"] = label
+
+        return self.to_torch(data_dict)
+
+    def _load_volume_and_header(self, file, data_dir):
+        vol = self._load_volume(file, data_dir)
+        header_path = os.path.join(data_dir, self.task_name, file + ".pkl")
+        header = load_pickle(header_path)
+        return vol, header
+
+    def _load_label(self, file, data_dir):
+        # For classification and regression, labels are in .txt files
+        txt_file = os.path.join(data_dir, self.task_name, file + ".txt")
+        if self.task_type == "classification":
+            return np.loadtxt(txt_file, dtype=int)
+        else:  # regression
+            reg_label = np.loadtxt(txt_file, dtype=float)
+            reg_label = np.atleast_1d(reg_label)
+            return reg_label
+
+    def _load_volume(self, file, data_dir):
+        # Construct the full path: data_dir/task_name/file.npy
+        file_path = os.path.join(data_dir, self.task_name, file + ".npy")
+
+        try:
+            vol = np.load(file_path, "r")
+        except ValueError:
+            vol = np.load(file_path, allow_pickle=True)
+
+        return vol
 
 class PretrainDataset(Dataset):
     def __init__(
@@ -754,7 +937,7 @@ class TrackedUniquePatientBatchSampler(UniquePatientBatchSampler):
         if self.epoch_count % 10 == 0:
             print(f"Epoch {self.epoch_count}: Processed {len(epoch_selections)} unique patients")
 
-            
+
 import random
 from typing import Iterator, List, Dict
 import torch
@@ -766,14 +949,14 @@ class DistributedUniquePatientBatchSampler(Sampler):
     """
     Distributed version that maintains the same interface as UniquePatientBatchSampler
     """
-    
+
     def __init__(self, dataset, batch_size, drop_last=False, shuffle=True, seed=0):
         self.dataset = dataset
         self.batch_size = batch_size
         self.drop_last = drop_last
         self.shuffle = shuffle
         self.seed = seed
-        
+
         self.patient_to_indices = {}
         for idx in range(len(dataset)):
             sample = dataset[idx]
@@ -781,10 +964,10 @@ class DistributedUniquePatientBatchSampler(Sampler):
             if patient_name not in self.patient_to_indices:
                 self.patient_to_indices[patient_name] = []
             self.patient_to_indices[patient_name].append(idx)
-        
+
         self.patients = list(self.patient_to_indices.keys())
         self.num_patients = len(self.patients)
-        
+
         # Distributed settings
         if dist.is_available() and dist.is_initialized():
             self.num_replicas = dist.get_world_size()
@@ -792,16 +975,16 @@ class DistributedUniquePatientBatchSampler(Sampler):
         else:
             self.num_replicas = 1
             self.rank = 0
-            
+
         self.epoch = 0
         self.selection_history = {}
-        
+
         # Calculate how many patients each GPU should handle
         self.num_patients_per_replica = self.num_patients // self.num_replicas
         if self.rank == self.num_replicas - 1:
             # Last GPU gets any remaining patients
             self.num_patients_per_replica = self.num_patients - (self.num_replicas - 1) * self.num_patients_per_replica
-        
+
         print(f"[Rank {self.rank}] DistributedUniquePatientBatchSampler initialized:")
         print(f"  Total patients: {self.num_patients}")
         print(f"  Patients for this GPU: {self.num_patients_per_replica}")
@@ -816,60 +999,60 @@ class DistributedUniquePatientBatchSampler(Sampler):
         # Create deterministic shuffle based on epoch
         g = torch.Generator()
         g.manual_seed(self.seed + self.epoch)
-        
+
         # Shuffle patients deterministically (all GPUs get same order)
         if self.shuffle:
             indices = torch.randperm(len(self.patients), generator=g).tolist()
             patients_order = [self.patients[i] for i in indices]
         else:
             patients_order = self.patients.copy()
-        
+
         # Split patients among GPUs
         patients_per_replica = len(patients_order) // self.num_replicas
         start_idx = self.rank * patients_per_replica
         end_idx = start_idx + patients_per_replica
-        
+
         # Last GPU gets remaining patients
         if self.rank == self.num_replicas - 1:
             end_idx = len(patients_order)
-            
+
         my_patients = patients_order[start_idx:end_idx]
-        
+
         # Generate batches for this GPU
         batch = []
         for patient in my_patients:
             # Select index for this patient
             available_indices = self.patient_to_indices[patient]
-            
+
             # If patient has multiple samples, try to select different ones
             if len(available_indices) > 1:
                 if patient not in self.selection_history:
                     self.selection_history[patient] = []
-                
+
                 recent_indices = self.selection_history[patient][-3:]
                 unused_indices = [idx for idx in available_indices if idx not in recent_indices]
-                
+
                 if unused_indices:
                     idx_pos = int(torch.randint(len(unused_indices), (1,), generator=g))
                     idx = unused_indices[idx_pos]
                 else:
                     idx_pos = int(torch.randint(len(available_indices), (1,), generator=g))
                     idx = available_indices[idx_pos]
-                
+
                 self.selection_history[patient].append(idx)
             else:
                 idx = available_indices[0]
-            
+
             batch.append(idx)
-            
+
             if len(batch) == self.batch_size:
                 yield batch
                 batch = []
-        
+
         # Handle last batch
         if len(batch) > 0 and not self.drop_last:
             yield batch
-    
+
     def __len__(self) -> int:
         """Returns the number of batches per epoch for this replica"""
         my_patients = self.num_patients_per_replica

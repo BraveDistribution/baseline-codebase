@@ -1660,6 +1660,403 @@ class RegressionFinetuner2(pl.LightningModule):
         
         return model
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import pytorch_lightning as pl
+from typing import Tuple, Optional
+
+from monai.networks.nets import SwinUNETR
+from torchmetrics.regression import PearsonCorrCoef
+from peft import get_peft_model, LoraConfig
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import pytorch_lightning as pl
+from torchmetrics.regression import PearsonCorrCoef
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import wandb
+from typing import Tuple
+from peft import LoraConfig, get_peft_model
+
+
+
+class RegressionFinetuner3(pl.LightningModule):
+    """
+    Implements a regression finetuner using a pre-trained SwinUNETR encoder.
+
+    Key Features:
+    - Loads weights from a self-supervised ContrastiveTransformer checkpoint.
+    - Uses LoRA for parameter-efficient fine-tuning.
+    - Normalizes regression targets using Z-score for robustness to outliers.
+    - Uses MAE (L1Loss) as the objective function.
+    - Logs a comparative distribution of train/validation labels at each epoch.
+    """
+    def __init__(
+        self,
+        in_channels: int,
+        target_mean: float,
+        target_std: float,
+        img_size: Tuple[int, int, int] = (96, 96, 96),
+        feature_size: int = 24,
+        lora_r: int = 128,
+        lora_alpha: int = 16,
+        learning_rate: float = 1e-3,
+        dropout_rate: float = 0.1,
+        max_epochs: int = 500,
+        predict_uncertainty: bool = False,
+        weight_decay: float = 0.01,
+        mixup_alpha: float = 0.4,          # Beta distribution α (0 disables MixUp)
+        mixup_prob: float = 0.5, 
+        **kwargs,
+    ):
+        super().__init__()
+        self.save_hyperparameters()
+        self.all_train_targets_for_plot = None
+        
+        # Flags to ensure we only log one batch of images per run
+        self.has_logged_train_batch = False
+        self.has_logged_val_batch = False
+
+        self.register_buffer("target_mean", torch.tensor(target_mean))
+        self.register_buffer("target_std", torch.tensor(target_std))
+
+        # 1. Base Encoder
+        self.encoder = SwinUNETR(
+            in_channels=1,
+            out_channels=1,
+            feature_size=self.hparams.feature_size,
+            use_checkpoint=True,
+            use_v2=True,
+        )
+
+        # 2. Apply PEFT/LoRA Wrapper
+        lora_config = LoraConfig(
+            r=self.hparams.lora_r,
+            lora_alpha=self.hparams.lora_alpha,
+            target_modules=["qkv"],
+            lora_dropout=0.1,
+            bias="none",
+        )
+        self.encoder = get_peft_model(self.encoder, lora_config)
+        # for name, param in self.encoder.base_model.model.named_parameters():
+        #     param.requires_grad = True
+
+        # 3. Multi-Scale Feature Extraction Setup
+        with torch.no_grad():
+            dummy_input = torch.zeros(1, 1, *self.hparams.img_size)
+            all_features = self.encoder.swinViT(dummy_input)
+            self.feature_dims = [f.shape[1] for f in all_features]
+
+        self.pools = nn.ModuleList([nn.AdaptiveAvgPool3d(1) for _ in range(5)])
+
+        # 4. Projection & Regression Heads
+        common_dim = 32
+        self.projections = nn.ModuleList(
+            [nn.Sequential(nn.Linear(dim, common_dim), nn.ReLU()) for dim in self.feature_dims]
+        )
+        
+        output_dim = 2 if self.hparams.predict_uncertainty else 1
+        self.regression_head = nn.Sequential(
+            nn.Linear(self.hparams.in_channels * 5 * common_dim, 64),
+            nn.LayerNorm(64),
+            nn.ReLU(),
+            nn.Dropout(self.hparams.dropout_rate),
+            nn.Linear(64, output_dim),
+            # IMPORTANT: No Sigmoid, as Z-score targets are unbounded
+        )
+        
+        self.val_corr = PearsonCorrCoef()
+        
+        # Lists to store step outputs for logging
+        self.training_step_outputs = []
+        self.validation_step_outputs = []
+        self.all_train_targets_for_plot = None
+
+    def _log_batch_images(self, images, targets, preds, step_name: str):
+        """Creates and logs a grid of image slices for a few samples in the batch."""
+        if not self.logger:
+            return
+            
+        # Move data to CPU and limit to a max of 4 samples
+        images = images.detach().cpu().numpy()
+        targets = targets.detach().cpu().numpy()
+        preds = preds.detach().cpu().numpy()
+        num_samples = min(4, len(images))
+
+        for i in range(num_samples):
+            image = images[i]
+            target = targets[i]
+            pred = preds[i]
+            
+            # image shape is (C, D, H, W)
+            num_modalities = image.shape[0]
+            
+            # Create a plot grid: one row per modality, 3 slices per row
+            fig, axes = plt.subplots(num_modalities, 3, figsize=(12, 4 * num_modalities), squeeze=False)
+            fig.suptitle(f"Sample {i} | True Age: {target:.1f} | Pred Age: {pred:.1f}", fontsize=16)
+            
+            for c in range(num_modalities):
+                modality_vol = image[c]
+                
+                # Get central slices
+                mid_d, mid_h, mid_w = [s // 2 for s in modality_vol.shape]
+                axial_slice = modality_vol[mid_d, :, :]
+                coronal_slice = modality_vol[:, mid_h, :]
+                sagittal_slice = modality_vol[:, :, mid_w]
+                
+                # Plot axial slice
+                axes[c, 0].imshow(axial_slice.T, cmap="bone", origin="lower")
+                axes[c, 0].set_title(f"Modality {c} (Axial)")
+                axes[c, 0].axis("off")
+                
+                # Plot coronal slice
+                axes[c, 1].imshow(coronal_slice.T, cmap="bone", origin="lower")
+                axes[c, 1].set_title(f"Modality {c} (Coronal)")
+                axes[c, 1].axis("off")
+
+                # Plot sagittal slice
+                axes[c, 2].imshow(sagittal_slice.T, cmap="bone", origin="lower")
+                axes[c, 2].set_title(f"Modality {c} (Sagittal)")
+                axes[c, 2].axis("off")
+            
+            plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust layout for suptitle
+            
+            self.logger.experiment.log({
+                f"{step_name}/batch_visualization_{i}": wandb.Image(fig)
+            })
+            plt.close(fig)
+
+
+    @classmethod
+    def load_from_pretrained(
+        cls,
+        checkpoint_path: str,
+        in_channels: int,
+        target_mean: float,
+        target_std: float,
+        **kwargs
+    ):
+        """
+        Loads a pretrained ContrastiveTransformer, creates an instance of this
+        finetuner, and transfers the encoder weights.
+        """
+        print(f"Loading pretrained model from: {checkpoint_path}")
+        pretrain_model = ContrastiveTransformer.load_from_checkpoint(checkpoint_path)
+
+        finetuner_hparams = pretrain_model.hparams
+        finetuner_hparams.update(kwargs)
+        finetuner_hparams['in_channels'] = in_channels
+        finetuner_hparams['target_mean'] = target_mean
+        finetuner_hparams['target_std'] = target_std
+
+        model = cls(**finetuner_hparams)
+        print("\nFinetuner instantiated. Now transferring weights...")
+
+        src_dict = pretrain_model.encoder.swinViT.state_dict()
+        base_encoder = model.encoder.base_model.model
+        dst_dict = base_encoder.swinViT.state_dict()
+        
+        filtered_state_dict = {
+            k: v for k, v in src_dict.items()
+            if k in dst_dict and v.shape == dst_dict[k].shape
+        }
+        
+        msg = base_encoder.swinViT.load_state_dict(filtered_state_dict, strict=False)
+        
+        print(f"\n✓ Loaded {len(filtered_state_dict)} swinViT tensors from {checkpoint_path}")
+        print(f"  Missing keys: {len(msg.missing_keys)} | Unexpected keys: {len(msg.unexpected_keys)}")
+
+        print("\nEncoder wrapped with LoRA. Trainable parameters:")
+        model.encoder.print_trainable_parameters()
+        
+        return model
+
+    def _normalize(self, x: torch.Tensor) -> torch.Tensor:
+        """Applies Z-score normalization."""
+        eps = 1e-6
+        return (x - self.target_mean) / (self.target_std + eps)
+
+    def _unnormalize(self, x: torch.Tensor) -> torch.Tensor:
+        """Reverses Z-score normalization."""
+        return x * self.target_std + self.target_mean
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, D, H, W = x.shape
+        x_reshaped = x.view(B * C, 1, D, H, W)
+        all_features = self.encoder.swinViT(x_reshaped)
+        
+        pooled_features = [
+            self.projections[i](self.pools[i](features).view(B * C, -1))
+            for i, features in enumerate(all_features)
+        ]
+        
+        multi_scale = torch.cat(pooled_features, dim=1).view(B, -1)
+        output = self.regression_head(multi_scale)
+        
+        return output.squeeze(-1) if not self.hparams.predict_uncertainty else output
+
+    def compute_loss(self, pred, target):
+        """Computes the Mean Absolute Error (L1 Loss)."""
+        if self.hparams.predict_uncertainty:
+            pred = pred[:, 0]
+        return F.l1_loss(pred, target)
+
+    def training_step(self, batch, batch_idx):
+        images, targets = batch['image'], batch['label'].float().view(-1)
+
+        # Keep an unmixed copy just for the epoch-0 preview grid
+        images_for_logging = images
+        targets_for_logging = targets
+
+        # Normalize targets *before* MixUp (affine -> mixing before/after is equivalent)
+        targets_normalized = self._normalize(targets)
+
+        # >>> MixUp here <<<
+        images, targets_normalized, lam = self._maybe_mixup(images, targets_normalized)
+
+        preds = self(images)
+        loss = self.compute_loss(preds, targets_normalized)
+
+        self.log('train/loss', loss, on_step=False, on_epoch=True, sync_dist=True)
+
+        # Log a clean, readable preview (non-mixed) only once at epoch 0
+        if self.current_epoch == 0 and not self.has_logged_train_batch:
+            preds_for_log = self(self._maybe_mixup(images_for_logging, targets_normalized)[0])  # run forward on clean batch
+            preds_mean_norm = preds_for_log[:, 0] if self.hparams.predict_uncertainty else preds_for_log
+            preds_original = self._unnormalize(preds_mean_norm.detach())
+            self._log_batch_images(images_for_logging, targets_for_logging, preds_original, "train")
+            self.has_logged_train_batch = True
+
+        # Store labels on CPU for epoch-end aggregation (use original, non-mixed)
+        self.training_step_outputs.append(targets_for_logging.detach().cpu())
+
+        return loss
+
+    def on_train_epoch_end(self):
+        """Aggregates training labels at the end of the training epoch."""
+        if self.training_step_outputs:
+            # Concatenate all targets and store for the validation plot
+            self.all_train_targets_for_plot = torch.cat(self.training_step_outputs).numpy()
+            self.training_step_outputs.clear()
+
+    def validation_step(self, batch, batch_idx):
+        images, targets = batch['image'], batch['label'].float().view(-1)
+        preds = self(images)
+        
+        targets_normalized = self._normalize(targets)
+        loss = self.compute_loss(preds, targets_normalized)
+        
+        preds_mean_normalized = preds[:, 0] if self.hparams.predict_uncertainty else preds
+        preds_original = self._unnormalize(preds_mean_normalized.detach())
+        mae = F.l1_loss(preds_original, targets)
+        self.val_corr.update(preds_original, targets)
+        
+        log_dict = {
+            'val/loss': loss,
+            'val/mae': mae,
+            'val/correlation': self.val_corr,
+        }
+        
+        self.log_dict(log_dict, prog_bar=True, on_epoch=True, sync_dist=True)
+        
+        if self.current_epoch == 0 and not self.has_logged_val_batch:
+            self._log_batch_images(images, targets, preds_original, "validation")
+            self.has_logged_val_batch = True
+
+        self.validation_step_outputs.append({'preds': preds_original, 'targets': targets})
+
+    def on_validation_epoch_end(self):
+        if not self.trainer.sanity_checking and self.validation_step_outputs:
+            if self.logger and self.trainer.global_rank == 0:
+                preds = torch.cat([x['preds'] for x in self.validation_step_outputs]).cpu().numpy()
+                targets = torch.cat([x['targets'] for x in self.validation_step_outputs]).cpu().numpy()
+                
+                fig, ax1 = plt.subplots(figsize=(12, 7))
+                
+                # Determine plot bounds from all available data
+                min_val, max_val = targets.min(), targets.max()
+                if self.all_train_targets_for_plot is not None:
+                    min_val = min(min_val, self.all_train_targets_for_plot.min())
+                    max_val = max(max_val, self.all_train_targets_for_plot.max())
+
+                bins = np.linspace(min_val, max_val, num=50)
+
+                # Plot validation ground truth
+                ax1.hist(targets, bins=bins, alpha=0.6, color="blue", label="Ground Truth (Val)", density=True)
+                
+                # Overlay training ground truth as a step plot for clarity
+                if self.all_train_targets_for_plot is not None:
+                    ax1.hist(self.all_train_targets_for_plot, bins=bins, alpha=0.8, histtype='step',
+                             linewidth=1.5, color="green", label="Ground Truth (Train)", density=True)
+
+                # Plot predictions
+                ax1.hist(preds, bins=bins, alpha=0.5, color="red", label="Predictions (Val)", density=True)
+                
+                ax1.set_title(f"Label Distributions & Predictions (Epoch {self.current_epoch})")
+                ax1.set_xlabel("Value"); ax1.set_ylabel("Density")
+                ax1.legend(); ax1.grid(True, alpha=0.3)
+                
+                self.logger.experiment.log({
+                    "validation/prediction_distribution": wandb.Image(fig)
+                })
+                plt.close(fig)
+            
+            # Clear stored data for the next epoch
+            self.validation_step_outputs.clear()
+            self.all_train_targets_for_plot = None
+
+    def configure_optimizers(self):
+        trainable_params = filter(lambda p: p.requires_grad, self.parameters())
+        optimizer = torch.optim.AdamW(
+            trainable_params, 
+            lr=self.hparams.learning_rate,
+            weight_decay=self.hparams.weight_decay
+        )
+        
+        total_steps = self.trainer.estimated_stepping_batches
+        
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=self.hparams.learning_rate,
+            total_steps=total_steps,
+            pct_start=0.1,
+            anneal_strategy='cos',
+        )
+
+        return {
+            'optimizer': optimizer,
+            'lr_scheduler': {'scheduler': scheduler, 'interval': 'step'}
+        }
+
+    def _maybe_mixup(self, images: torch.Tensor, targets_norm: torch.Tensor):
+        """
+        Applies MixUp to 3D images and normalized regression targets with prob p.
+        Returns (images, targets_norm, lam) where lam is the mixing coefficient used.
+        """
+        alpha = float(self.hparams.mixup_alpha)
+        p = float(self.hparams.mixup_prob)
+        if (not self.training) or alpha <= 0.0 or torch.rand(1, device=images.device).item() > p:
+            return images, targets_norm, None
+
+        # Sample lam ~ Beta(alpha, alpha); enforce lam >= 0.5 for symmetry (optional)
+        lam = torch.distributions.Beta(alpha, alpha).sample().to(images.device)
+        lam = torch.maximum(lam, 1.0 - lam)
+
+        B = images.size(0)
+        index = torch.randperm(B, device=images.device)
+
+        mixed_images = lam * images + (1.0 - lam) * images[index]
+        mixed_targets_norm = lam * targets_norm + (1.0 - lam) * targets_norm[index]
+
+        return mixed_images, mixed_targets_norm, lam
+
+
 if __name__ == "__main__":
     model = ClassificationFineTuner.load_from_checkpoint(
         '/home/mg873uh/Projects_kb/checkpoints/contrastive_2gpu_1131/last.ckpt',
