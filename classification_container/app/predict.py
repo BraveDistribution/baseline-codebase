@@ -10,6 +10,7 @@ from typing import List, Dict, Any, Tuple, Sequence
 from monai.networks.nets.swin_unetr import SwinUNETR
 import math
 import nibabel as nib
+import numpy as np
 
 from yucca.functional.preprocessing import (
     preprocess_case_for_inference,
@@ -19,6 +20,8 @@ from yucca.functional.preprocessing import (
 from torchmetrics import AUROC
 from torchmetrics.classification import BinaryAccuracy
 from torch.optim.lr_scheduler import LambdaLR
+
+from yucca.modules.data.augmentation.transforms.cropping_and_padding import CropPad
 
 def generate_random_mask(
     x: torch.Tensor,
@@ -632,6 +635,17 @@ def predict_from_config(
         transpose_forward=[0, 1, 2],  # Standard transpose order
     )
 
+    x_np = case_preprocessed.squeeze(0).detach().numpy()
+
+
+    croppad = CropPad(patch_size=(96, 96, 96))
+    out = croppad(
+        packed_data_dict={"image": x_np},
+        image_properties={"foreground_locations": []}
+    )
+    x_np = out["image"].astype(np.float32, copy=False)
+    case_preprocessed = torch.from_numpy(np.ascontiguousarray(x_np)).unsqueeze(0)
+
     # Load the model checkpoint directly with Lightning
 
     model = ClassificationFinetuner2.load_from_pretrained(
@@ -645,7 +659,6 @@ def predict_from_config(
 
     # Set model to evaluation mode
     model.eval()
-
     # Get device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
@@ -693,7 +706,7 @@ predict_config = {
     # Import values from task_configs
     **task1_config,
     # Add inference-specific configs
-    "model_path": "/app/weights/brano_new.ckpt",  # Path to model (inside container!)
+    "model_path": "/app/weights/brano_checkpoint_classification_258.ckpt",  # Path to model (inside container!)
     "patch_size": (96, 96, 96),  # Patch size for inference
 }
 

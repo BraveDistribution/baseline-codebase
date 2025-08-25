@@ -10,6 +10,7 @@ from typing import List, Dict, Any, Tuple, Sequence
 from monai.networks.nets.swin_unetr import SwinUNETR
 import math
 import nibabel as nib
+import numpy as np
 
 from yucca.functional.preprocessing import (
     preprocess_case_for_inference,
@@ -17,6 +18,8 @@ from yucca.functional.preprocessing import (
 )
 
 from torchmetrics.regression import PearsonCorrCoef
+
+from yucca.modules.data.augmentation.transforms.cropping_and_padding import CropPad
 
 def generate_random_mask(
     x: torch.Tensor,
@@ -647,6 +650,17 @@ def predict_from_config(
         keep_aspect_ratio=keep_aspect_ratio,
         transpose_forward=[0, 1, 2],  # Standard transpose order
     )
+
+    x_np = case_preprocessed.squeeze(0).detach().numpy()
+
+
+    croppad = CropPad(patch_size=(96, 96, 96))
+    out = croppad(
+        packed_data_dict={"image": x_np},
+        image_properties={"foreground_locations": []}
+    )
+    x_np = out["image"].astype(np.float32, copy=False)
+    case_preprocessed = torch.from_numpy(np.ascontiguousarray(x_np)).unsqueeze(0)
 
     # Load the model checkpoint directly with Lightning
 
