@@ -33,7 +33,7 @@ from yucca.modules.data.datasets.YuccaDataset import YuccaTrainDataset
 
 from yucca.pipeline.configuration.split_data import get_split_config
 from yucca.pipeline.configuration.configure_paths import detect_version
-from data.dataset import FOMODataset
+from data.dataset import FOMODataset, HierarchicalDataset
 from data.task_configs import task1_config, task2_config, task3_config
 
 
@@ -113,6 +113,9 @@ def main():
     parser.add_argument(
         "--experiment", type=str, default="experiment", help="name of experiment"
     )
+    parser.add_argument(
+        "--hierarchical", action="store_true", help="Use hierarchical dataset (dual resolution)"
+    )
     args = parser.parse_args()
 
     assert (
@@ -128,10 +131,12 @@ def main():
     labels = task_cfg["labels"]
 
     run_type = "from_scratch" if args.pretrained_weights_path is None else "finetune"
-    experiment_name = f"{run_type}_{args.model_name}_{args.experiment}_{args.taskid}"
+    dataset_mode = "hierarchical" if args.hierarchical else "standard"
+    experiment_name = f"{run_type}_{args.model_name}_{args.experiment}_{args.taskid}_{dataset_mode}"
 
     print(f"Using num_workers: {args.num_workers}, num_devices: {args.num_devices}")
     print(f"Task type: {task_type}")
+    print(f"Dataset mode: {dataset_mode}")
     print("ARGS:", args)
 
     # Set up directory structure
@@ -263,11 +268,17 @@ def main():
         deep_supervision=False,
     )
 
+    # Select appropriate dataset class based on task type and hierarchical flag
+    if task_type == "segmentation":
+        dataset_class = YuccaTrainDataset
+    elif args.hierarchical:
+        dataset_class = HierarchicalDataset
+    else:
+        dataset_class = FOMODataset
+
     # Create the data module that handles loading and batching
     data_module = YuccaDataModule(
-        train_dataset_class=(
-            YuccaTrainDataset if task_type == "segmentation" else FOMODataset
-        ),
+        train_dataset_class=dataset_class,
         composed_train_transforms=augmenter.train_transforms,
         composed_val_transforms=augmenter.val_transforms,
         patch_size=config["patch_size"],

@@ -138,7 +138,7 @@ class PretrainDataModule(pl.LightningDataModule):
     def _build_patient_to_indices(self, dataset):
         """Build patient_to_indices mapping from CombinedPretrainingV2 dataset"""
         patient_to_indices = {}
-        
+
         # The dataset has index_to_patient attribute
         if hasattr(dataset, 'index_to_patient'):
             for idx in range(len(dataset.index_to_patient)):
@@ -158,7 +158,7 @@ class PretrainDataModule(pl.LightningDataModule):
                 except Exception as e:
                     print(f"Warning: Could not get patient for index {idx}: {e}")
                     continue
-        
+
         print(f"Built patient_to_indices mapping with {len(patient_to_indices)} patients")
         return patient_to_indices
 
