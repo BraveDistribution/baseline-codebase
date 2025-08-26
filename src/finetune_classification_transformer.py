@@ -43,128 +43,53 @@ import logging
 from typing import Optional, Literal, Union
 from os.path import join
 import torchvision
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
-
-class AgeBalancedSampler:
-    """
-    Custom sampler for age-balanced sampling in regression tasks.
-    Can be used as a drop-in replacement for InfiniteRandomSampler.
-    """
-    def __init__(self, 
-                 dataset,
-                 num_bins: int = 15,
-                 strategy: Literal['uniform', 'sqrt', 'smooth'] = 'uniform',
-                 temperature: float = 0.8,
-                 infinite: bool = True):
-        """
-        Args:
-            dataset: Dataset with a 'labels' property
-            num_bins: Number of age bins
-            strategy: Weighting strategy
-            temperature: Rebalancing strength
-            infinite: Whether to use infinite sampling (like InfiniteRandomSampler)
-        """
+class AgeBalancedWeights:
+    """Keep only the weighting logic."""
+    def __init__(self, dataset, num_bins=15, strategy='uniform', temperature=0.8):
         self.dataset = dataset
         self.num_bins = num_bins
         self.strategy = strategy
         self.temperature = temperature
-        self.infinite = infinite
-        
-        # Get labels and create weights
         self.labels = self._get_labels()
         self.weights = self._create_weights()
-        
+
     def _get_labels(self):
-        """Extract labels from dataset."""
         if hasattr(self.dataset, 'labels'):
             return self.dataset.labels
-        else:
-            # Fallback: iterate through dataset to get labels
-            logging.info("Extracting labels from dataset for age balancing...")
-            labels = []
-            for i in range(len(self.dataset)):
-                sample = self.dataset[i]
-                if isinstance(sample, dict) and 'label' in sample:
-                    labels.append(sample['label'].item() if torch.is_tensor(sample['label']) else sample['label'])
-            return labels
-    
-    def _create_weights(self):
-        """Create sampling weights based on age distribution."""
-        labels_tensor = torch.tensor(self.labels, dtype=torch.float32)
-        
-        # Create age bins
-        min_val, max_val = labels_tensor.min().item(), labels_tensor.max().item()
-        bins = torch.linspace(min_val, max_val + 1e-5, self.num_bins + 1)
-        binned_labels = torch.bucketize(labels_tensor, bins)
-        
-        # Count samples in each bin
-        bin_counts = Counter(binned_labels.numpy())
-        
-        # Ensure all bins are represented
-        for i in range(self.num_bins + 1):
-            if i not in bin_counts:
-                bin_counts[i] = 0
-        
-        # Calculate effective counts (avoid division by zero)
-        effective_counts = {
-            bin_id: max(count, 1) 
-            for bin_id, count in bin_counts.items()
-        }
-        
-        # Calculate weights based on strategy
-        if self.strategy == 'uniform':
-            max_count = max(effective_counts.values())
-            bin_weights = {
-                bin_id: max_count / count 
-                for bin_id, count in effective_counts.items()
-            }
-        elif self.strategy == 'sqrt':
-            max_count = max(effective_counts.values())
-            bin_weights = {
-                bin_id: np.sqrt(max_count / count)
-                for bin_id, count in effective_counts.items()
-            }
-        elif self.strategy == 'smooth':
-            counts_array = np.array(list(effective_counts.values()))
-            median_count = np.median(counts_array[counts_array > 0])
-            bin_weights = {
-                bin_id: (median_count / count) ** self.temperature
-                for bin_id, count in effective_counts.items()
-            }
-        
-        # Normalize weights
-        total_weight = sum(bin_weights.values())
-        bin_weights = {k: v / total_weight * len(bin_weights) for k, v in bin_weights.items()}
-        
-        # Assign weights to samples
-        sample_weights = [bin_weights[binned_labels[i].item()] for i in range(len(self.labels))]
-        
-        logging.info(f"Created age-balanced weights with {self.num_bins} bins using {self.strategy} strategy")
-        logging.info(f"Age range: {min_val:.1f} - {max_val:.1f} years")
-        
-        return torch.DoubleTensor(sample_weights)
-    
-    def __iter__(self):
-        """Return the appropriate sampler iterator."""
-        if self.infinite:
-            # Infinite sampling with replacement
-            while True:
-                yield from WeightedRandomSampler(
-                    self.weights, 
-                    len(self.dataset),
-                    replacement=True
-                )
-        else:
-            # Single epoch sampling
-            yield from WeightedRandomSampler(
-                self.weights,
-                len(self.dataset),
-                replacement=True
-            )
-    
-    def __len__(self):
-        return len(self.dataset)
+        labels = []
+        for i in range(len(self.dataset)):
+            sample = self.dataset[i]
+            if isinstance(sample, dict) and 'label' in sample:
+                v = sample['label']
+                labels.append(v.item() if torch.is_tensor(v) else v)
+        return labels
 
+    def _create_weights(self):
+        labels_tensor = torch.tensor(self.labels, dtype=torch.float32)
+        q = torch.linspace(0, 1, self.num_bins + 1)
+        labels_jitter = labels_tensor + 1e-4 * torch.randn_like(labels_tensor)
+        bins = torch.quantile(labels_jitter, q)
+        bins, _ = torch.sort(torch.unique(bins))
+        num_bins = max(1, bins.numel() - 1)
+        binned = torch.bucketize(labels_tensor, bins, right=True) - 1
+        binned = binned.clamp(min=0, max=num_bins - 1)
+        counts = torch.bincount(binned, minlength=num_bins).float()
+        eps = 1.0
+        if self.strategy == 'uniform':
+            alpha = 1.0
+        elif self.strategy == 'sqrt':
+            alpha = 0.5
+        elif self.strategy == 'smooth':
+            alpha = max(0.1, min(1.0, self.temperature))
+        else:
+            alpha = 0.5
+        raw_w = (counts + eps).pow(-alpha)
+        w = raw_w / raw_w.mean()
+        w = torch.minimum(w, w.median() * 3.0)
+        w = 0.3 * torch.ones_like(w) + 0.7 * w   # blend
+        return w[binned].double()
 
 class YuccaDataModuleWithBalancing(pl.LightningDataModule):
     """
@@ -312,7 +237,7 @@ class YuccaDataModuleWithBalancing(pl.LightningDataModule):
             sampler = AgeBalancedSampler(
                 self.train_dataset,
                 num_bins=self.age_balance_config.get('num_bins', 15),
-                strategy=self.age_balance_config.get('strategy', 'uniform'),
+                strategy=self.age_balance_config.get('strategy', 'sqrt'),
                 temperature=self.age_balance_config.get('temperature', 0.8),
                 infinite=True  # Match InfiniteRandomSampler behavior
             )
@@ -421,31 +346,16 @@ def create_balanced_datamodule(config):
     return datamodule
 
 
-# Alternative: Minimal modification approach
 def add_age_balancing_to_existing_datamodule(datamodule, age_balance_config=None):
-    """
-    Monkey-patch an existing YuccaDataModule instance to add age balancing.
-    This is useful if you can't modify the class definition directly.
-    """
-    original_train_dataloader = datamodule.train_dataloader
-    
+    orig = datamodule.train_dataloader
+
     def balanced_train_dataloader(self):
-        # Check if this is a regression task
-        if self.task_type == 'regression':
-            config = age_balance_config or {
-                'num_bins': 15,
-                'strategy': 'uniform',
-                'temperature': 0.8
-            }
-            
-            sampler = AgeBalancedSampler(
-                self.train_dataset,
-                num_bins=config['num_bins'],
-                strategy=config['strategy'],
-                temperature=config['temperature'],
-                infinite=True
-            )
-            
+        if getattr(self, "task_type", None) == "regression":
+            cfg = age_balance_config or {'num_bins': 15, 'strategy': 'uniform', 'temperature': 0.8}
+            weights = AgeBalancedWeights(
+                self.train_dataset, cfg['num_bins'], cfg['strategy'], cfg['temperature']
+            ).weights
+            sampler = WeightedRandomSampler(weights, num_samples=len(self.train_dataset), replacement=True)
             return DataLoader(
                 self.train_dataset,
                 num_workers=self.num_workers,
@@ -454,13 +364,9 @@ def add_age_balancing_to_existing_datamodule(datamodule, age_balance_config=None
                 sampler=sampler,
                 shuffle=False,
             )
-        else:
-            # Use original implementation for non-regression tasks
-            return original_train_dataloader()
-    
-    # Replace the method
+        return orig()
+
     datamodule.train_dataloader = balanced_train_dataloader.__get__(datamodule, type(datamodule))
-    
     return datamodule
 
 
@@ -499,10 +405,13 @@ def train(
     else:
         raise ValueError(f"Unsupported task type: {task_type}")
 
+    monitor = "val/loss"
+    if split_param < 0.05:
+        monitor = "train/loss"
     checkpoint_callback = ModelCheckpoint(
         dirpath=save_checkpoint_dir,
-        filename="best-checkpoint-{}".format(task_type),
-        monitor="val/loss",
+        filename="best-checkpoint-{task_type}-{val_loss:.4f}",
+        monitor=monitor,
         mode="min",
         save_top_k=5,
     )
@@ -542,15 +451,15 @@ def train(
         val_sampler=None,
     )
 
-    # Fix: Pass 'data_module' not 'datamodule'!
-    data_module = add_age_balancing_to_existing_datamodule(
-        data_module,  # ← Use the variable you created
-        age_balance_config={
-            'num_bins': 16,
-            'strategy': 'uniform',
-            'temperature': 0.8
-        }
-    )
+    if task_type == 'regression111':
+        data_module = add_age_balancing_to_existing_datamodule(
+            data_module,  # ← Use the variable you created
+            age_balance_config={
+                'num_bins': 6,
+                'strategy': 'smooth',
+                'temperature': 0.85
+            }
+        )
 
 
     wandb_logger = WandbLogger(
@@ -578,14 +487,14 @@ def train(
             max_epochs=50
         )
     elif task_type == "regression":
-        # model = RegressionFinetuner3.load_from_checkpoint(
-        #     str(model_checkpoint),
-        #     in_channels=num_modalities,
-        #     freeze_encoder=True,
-        #     learning_rate=1e-4,
-        #     max_epochs=50,
-        #     strict=False
-        # )
+        model = RegressionFinetuner2.load_from_checkpoint(
+            str(model_checkpoint),
+            in_channels=num_modalities,
+            freeze_encoder=True,
+            learning_rate=1e-4,
+            max_epochs=50,
+            strict=False
+        )
         model = RegressionFinetuner3.load_from_pretrained(
             checkpoint_path=str(model_checkpoint),
             in_channels=2,
@@ -597,9 +506,9 @@ def train(
         )
 
     elif task_type == 'segmentation':
-        model = SegmentationFineTuner.load_from_checkpoint(
+        model = SegmentationFineTuner.load_from_pretrained(
             str(model_checkpoint),
-            num_classes=1,
+            num_classes=2,
             in_channels=3,
             freeze_encoder=True,
             learning_rate=1e-4,
@@ -615,6 +524,7 @@ def train(
         limit_train_batches=30,
         accumulate_grad_batches=5,
         log_every_n_steps=15,
+        check_val_every_n_epoch=3,
         # num_sanity_val_steps=0,  # Skip validation sanity check
         # check_val_every_n_epoch=None,  # Disable validation entirely
     )
