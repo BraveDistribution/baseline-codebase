@@ -388,13 +388,13 @@ def create_loggers(config: HierarchicalConfig, version: int) -> list:
     """
     loggers = []
 
-    # Yucca logger for local logging
-    yucca_logger = YuccaLogger(
-        save_dir=config.save_dir,
-        version=version,
-        steps_per_epoch=config.train_batches_per_epoch,
-    )
-    loggers.append(yucca_logger)
+    # # Yucca logger for local logging
+    # yucca_logger = YuccaLogger(
+    #     save_dir=config.save_dir,
+    #     version=version,
+    #     steps_per_epoch=config.train_batches_per_epoch,
+    # )
+    # loggers.append(yucca_logger)
 
     # Wandb logger for cloud logging and visualization
     wandb_logger = WandbLogger(

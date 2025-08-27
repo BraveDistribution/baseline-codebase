@@ -521,20 +521,8 @@ class RegressionHierarchicalFinetuner(pl.LightningModule):
         if not self.logger:
             return
 
-        # Find WandB logger from the loggers list
-        wandb_logger = None
-        if hasattr(self.logger, '__iter__'):
-            # Multiple loggers case
-            for logger in self.logger:
-                if isinstance(logger, WandbLogger):
-                    wandb_logger = logger
-                    break
-        elif isinstance(self.logger, WandbLogger):
-            # Single WandB logger case
-            wandb_logger = self.logger
-
-        # Skip logging if no WandB logger is found
-        if wandb_logger is None:
+        # Use simple approach - just check if logger has experiment attribute
+        if not isinstance(self.logger, WandbLogger):
             return
 
         # Move data to CPU and limit to a max of 2 samples to avoid cluttering
@@ -582,7 +570,7 @@ class RegressionHierarchicalFinetuner(pl.LightningModule):
 
             plt.tight_layout(rect=[0, 0.03, 1, 0.95])
 
-            wandb_logger.experiment.log({
+            self.logger.experiment.log({
                 f"{step_name}/hierarchical_batch_visualization_{i}": wandb.Image(fig)
             })
             plt.close(fig)
@@ -815,23 +803,12 @@ class RegressionHierarchicalFinetuner(pl.LightningModule):
                 ax1.set_xlabel("Value"); ax1.set_ylabel("Density")
                 ax1.legend(); ax1.grid(True, alpha=0.3)
 
-                # Find WandB logger from the loggers list and log if available
-                wandb_logger = None
-                if hasattr(self.logger, '__iter__'):
-                    # Multiple loggers case
-                    for logger in self.logger:
-                        if isinstance(logger, WandbLogger):
-                            wandb_logger = logger
-                            break
-                elif isinstance(self.logger, WandbLogger):
-                    # Single WandB logger case
-                    wandb_logger = self.logger
-
-                # Only log to WandB if available
-                if wandb_logger is not None:
-                    wandb_logger.experiment.log({
+                if hasattr(self.logger, 'experiment'):
+                    self.logger.experiment.log({
                         "validation/prediction_distribution": wandb.Image(fig)
                     })
+                else:
+                    print("Invalid logger: Skipping validation/prediction_distribution logging.")
 
                 plt.close(fig)
 
