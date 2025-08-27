@@ -32,14 +32,10 @@ Date: August 2025
 """
 
 import os
-import sys
 import argparse
 import logging
 import pytorch_lightning as pl
-import torch
-import numpy as np
-from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Dict, Any
 
 # Lightning components
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
@@ -83,11 +79,11 @@ class HierarchicalConfig:
         self.feature_size = args.feature_size
         self.freeze_global_encoder = args.freeze_global_encoder
 
-        # LoRA configuration for local encoder
+        # LoRA configuration for local encoder (defaults from classification transformer)
         self.lora_r = args.lora_r
         self.lora_alpha = args.lora_alpha
 
-        # Model-specific parameters
+        # Model-specific parameters for regression tasks
         if self.task_type == "regression":
             self.target_mean = args.target_mean
             self.target_std = args.target_std
@@ -104,7 +100,6 @@ class HierarchicalConfig:
         self.train_batches_per_epoch = args.train_batches_per_epoch
 
         # === DATA CONFIGURATION ===
-        self.data_dir = args.data_dir
         self.local_data_dir = args.local_data_dir
         self.global_data_dir = args.global_data_dir
         self.augmentation_preset = args.augmentation_preset
@@ -132,7 +127,7 @@ class HierarchicalConfig:
         self.max_iterations = self.epochs * self.train_batches_per_epoch
 
         # Experiment naming
-        self.full_experiment_name = f"Finetune_{self.global_encoder}_{self.experiment_name}_{self.task_id}"
+        self.full_experiment_name = f"{self.experiment_name}_{self.task_type}_Task00{self.task_id}"
 
         # Global encoder configuration for hierarchical model
         self.global_config = {
@@ -295,7 +290,7 @@ def create_data_module(config: HierarchicalConfig) -> YuccaDataModule:
     )
 
     # Set up data splits
-    train_data_dir = os.path.join(config.data_dir, config.task_name)
+    train_data_dir = os.path.join(config.local_data_dir, config.task_name)
     path_config = SimplePathConfig(train_data_dir=train_data_dir)
 
     if config.split_method == "kfold":
@@ -309,9 +304,18 @@ def create_data_module(config: HierarchicalConfig) -> YuccaDataModule:
         path_config=path_config,
     )
 
+    # Create a partial function to pass local_data_dir and global_data_dir to HierarchicalDataset
+    from functools import partial
+
+    HierarchicalDatasetWithConfig = partial(
+        HierarchicalDataset,
+        local_data_dir=config.local_data_dir,
+        global_data_dir=config.global_data_dir,
+    )
+
     # Create data module with HierarchicalDataset
     data_module = YuccaDataModule(
-        train_dataset_class=HierarchicalDataset,
+        train_dataset_class=HierarchicalDatasetWithConfig,
         composed_train_transforms=augmenter.train_transforms,
         composed_val_transforms=augmenter.val_transforms,
         patch_size=config.patch_size,
@@ -323,9 +327,6 @@ def create_data_module(config: HierarchicalConfig) -> YuccaDataModule:
         split_idx=config.split_idx,
         num_workers=config.num_workers,
         val_sampler=None,
-        # HierarchicalDataset specific parameters
-        local_data_dir=config.local_data_dir,
-        global_data_dir=config.global_data_dir,
     )
 
     return data_module
@@ -587,8 +588,8 @@ def parse_arguments():
 
     # Regression-specific parameters
     regression_group = parser.add_argument_group("Regression Configuration")
-    regression_group.add_argument("--target_mean", type=float, default=45.0, help="Target mean for normalization")
-    regression_group.add_argument("--target_std", type=float, default=15.0, help="Target std for normalization")
+    regression_group.add_argument("--target_mean", type=float, default=61.87, help="Target mean for normalization")
+    regression_group.add_argument("--target_std", type=float, default=15.089118845634706, help="Target std for normalization")
     regression_group.add_argument("--predict_uncertainty", action="store_true", help="Predict uncertainty")
     regression_group.add_argument("--mixup_alpha", type=float, default=0.4, help="MixUp alpha parameter")
     regression_group.add_argument("--mixup_prob", type=float, default=0.5, help="MixUp probability")
@@ -598,16 +599,12 @@ def parse_arguments():
     training_group.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate")
     training_group.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay")
     training_group.add_argument("--dropout_rate", type=float, default=0.1, help="Dropout rate")
-    training_group.add_argument("--batch_size", type=int, default=4, help="Batch size per device")
-    training_group.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
+    training_group.add_argument("--batch_size", type=int, default=2, help="Batch size per device")
+    training_group.add_argument("--epochs", type=int, default=500, help="Number of training epochs")
     training_group.add_argument("--train_batches_per_epoch", type=int, default=100, help="Batches per epoch")
 
     # === DATA CONFIGURATION ===
     data_group = parser.add_argument_group("Data Configuration")
-    data_group.add_argument(
-        "--data_dir", type=str, default="./data/preprocessed",
-        help="Base data directory"
-    )
     data_group.add_argument(
         "--local_data_dir", type=str,
         default="/home/mg873uh/Projects_kb/data/finetuning_preproc/",
