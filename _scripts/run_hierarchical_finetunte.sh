@@ -24,7 +24,7 @@ echo "Running hierarchical finetuning for task ${TASKID}..."
 python src/finetune_hierarchical.py \
     --task_id ${TASKID} \
     --model_type regression \
-    --global_encoder unet_b \
+    --global_encoder unet_b_lw_dec \
     --local_data_dir /home/mg873uh/Projects_kb/data/finetuning_preproc \
     --global_data_dir /home/mg873uh/Projects_kb/data/finetuning_preproc/Unified_2.6667mm_float16 \
     --save_dir /home/mg873uh/Projects_kb/baseline-codebase/_models/hierarchical \

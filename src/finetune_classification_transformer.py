@@ -13,7 +13,7 @@ from yucca.modules.data.augmentation.YuccaAugmentationComposer import (
     YuccaAugmentationComposer,
 )
 from yucca.pipeline.configuration.split_data import get_split_config
-from mato_models.models import ClassificationFineTuner, RegressionFineTuner, SegmentationFineTuner, ClassificationFinetuner2, RegressionFinetuner2, RegressionFinetuner3, RegressionFinetuner4, SegmentationProtoNet
+from mato_models.models import ClassificationFineTuner, RegressionFineTuner, SegmentationFineTuner, ClassificationFinetuner2, RegressionFinetuner2, RegressionFinetuner3,  SegmentationProtoNet
 from yucca.modules.data.data_modules.YuccaDataModule import YuccaDataModule
 from yucca.modules.callbacks.loggers import YuccaLogger
 from yucca.modules.data.datasets.YuccaDataset import YuccaTrainDataset
@@ -501,13 +501,15 @@ def train(
             in_channels=2,
             target_min=18.0,
             target_max=120.0,
+            target_mean=4.105172539442826,
+            target_std=0.28682802940837737,
             feature_size=24,
-            target_mean=61.87,
-            target_std=15.089118845634706,
+            original_target_mean=61.87,
+            # target_std=15.089118845634706,
         )
 
     elif task_type == 'segmentation':
-        model = SegmentationProtoNet.load_from_pretrained(
+        model = SegmentationFineTuner.load_from_pretrained(
             str(model_checkpoint),
             num_classes=2,
             in_channels=3,
@@ -526,6 +528,7 @@ def train(
         accumulate_grad_batches=5,
         log_every_n_steps=15,
         check_val_every_n_epoch=3,
+        gradient_clip_val=1.0,
         # num_sanity_val_steps=0,  # Skip validation sanity check
         # check_val_every_n_epoch=None,  # Disable validation entirely
     )

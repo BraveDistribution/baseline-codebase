@@ -21,6 +21,44 @@ import numpy as np
 from pytorch_lightning.loggers import WandbLogger
 
 
+class PearsonCorrLoss(nn.Module):
+    def __init__(self, eps=1e-8):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, y_pred, y_true):
+        y_pred = (y_pred - y_pred.mean()) / (y_pred.std() + self.eps)
+        y_true = (y_true - y_true.mean()) / (y_true.std() + self.eps)
+        return 1.0 - (y_pred * y_true).mean()  # minimize → maximize corr
+
+
+class CCCLoss(nn.Module):
+    # Concordance correlation: better when scale & bias drift exist
+    def __init__(self, eps=1e-8):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, y_hat, y):
+        y_hat_mu, y_mu = y_hat.mean(), y.mean()
+        y_hat_var = y_hat.var(unbiased=False) + self.eps
+        y_var = y.var(unbiased=False) + self.eps
+        cov = ((y_hat - y_hat_mu) * (y - y_mu)).mean()
+        ccc = (2*cov) / (y_hat_var + y_var + (y_hat_mu - y_mu).pow(2) + self.eps)
+        return 1 - ccc
+
+
+class ComboLoss(nn.Module):
+    def __init__(self, alpha=0.5, beta=0.5, delta=1.0):
+        super().__init__()
+        self.robust = nn.SmoothL1Loss(beta=delta)  # Huber
+        self.corr = PearsonCorrLoss()
+        self.ccc = CCCLoss()
+        self.alpha, self.beta = alpha, beta
+
+    def forward(self, y_hat, y):
+        return self.alpha*self.robust(y_hat, y) + self.beta*self.corr(y_hat, y) + (1-self.alpha-self.beta)*self.ccc(y_hat, y)
+
+
 class ContrastiveTransformer(pl.LightningModule):
     def __init__(
         self,
@@ -324,6 +362,10 @@ class RegressionHierarchicalFinetuner(pl.LightningModule):
         mixup_prob: float = 0.5,
         freeze_global_encoder: bool = True,
         global_checkpoint: str = None,  # Path to pretrained global encoder checkpoint
+        # Combo loss parameters
+        combo_alpha: float = 0.5,  # Weight for Huber loss
+        combo_beta: float = 0.3,   # Weight for Pearson correlation loss
+        combo_delta: float = 1.0,  # Huber loss delta parameter
         **kwargs,
     ):
         super().__init__()
@@ -358,14 +400,23 @@ class RegressionHierarchicalFinetuner(pl.LightningModule):
 
         # 2. Global Encoder - from BaseSupervisedModel
         from models import networks
+        from models.networks.unet import UNetEncoder
         model_factory = getattr(networks, global_config["model_name"])
 
-        # Create the global encoder using the factory function
-        self.global_encoder = model_factory(
+        # Create only the encoder part by directly using UNetEncoder
+        # First get the encoder block from the model factory to match the configuration
+        temp_model = model_factory(
             input_channels=global_config["num_modalities"],
             output_channels=global_config["num_classes"],
-            mode="regression",  # Ensure regression mode
         )
+        # Extract the encoder configuration and create only the encoder
+        self.global_encoder = UNetEncoder(
+            input_channels=global_config["num_modalities"],
+            starting_filters=temp_model.encoder.filters,
+            basic_block=temp_model.encoder_block,
+        )
+        # Delete temporary model to free memory
+        del temp_model
 
         # Optionally freeze global encoder
         if self.hparams.freeze_global_encoder:
@@ -376,6 +427,7 @@ class RegressionHierarchicalFinetuner(pl.LightningModule):
         with torch.no_grad():
             dummy_input = torch.zeros(1, 1, *self.hparams.img_size)
             local_features = self.local_encoder.swinViT(dummy_input)
+            self.local_features = local_features #INFO: Stored to object for debugging (test_hierarchical_feat_dims.py)
             self.local_feature_dims = [f.shape[1] for f in local_features]
 
         self.local_pools = nn.ModuleList([nn.AdaptiveAvgPool3d(1) for _ in range(5)])
@@ -384,15 +436,16 @@ class RegressionHierarchicalFinetuner(pl.LightningModule):
         with torch.no_grad():
             dummy_global = torch.zeros(1, global_config["num_modalities"], *self.hparams.img_size)
             global_features = self.global_encoder(dummy_global)
+            self.global_features = global_features #INFO: Stored to object for debugging (test_hierarchical_feat_dims.py)
             # Handle different output types from global encoder
             if isinstance(global_features, torch.Tensor):
-                self.global_feature_dim = global_features.shape[1] if len(global_features.shape) > 1 else global_features.numel()
+                self.global_feature_dims = [global_features.shape[1]] if len(global_features.shape) > 1 else [global_features.numel()]
             else:
-                # If it's a list or tuple, take the first element
-                self.global_feature_dim = global_features[0].shape[1] if len(global_features[0].shape) > 1 else global_features[0].numel()
+                # If it's a list or tuple, extract all feature dimensions (same as local)
+                self.global_feature_dims = [f.shape[1] for f in global_features]
 
-        # Global feature pooling
-        self.global_pool = nn.AdaptiveAvgPool3d(1)
+        # Global feature pooling - now we need multiple pools for multi-scale features
+        self.global_pools = nn.ModuleList([nn.AdaptiveAvgPool3d(1) for _ in range(len(self.global_feature_dims))])
 
         # 5. Projection & Fusion
         common_dim = 32
@@ -402,17 +455,36 @@ class RegressionHierarchicalFinetuner(pl.LightningModule):
             [nn.Sequential(nn.Linear(dim, common_dim), nn.ReLU()) for dim in self.local_feature_dims]
         )
 
-        # Global projection
-        self.global_projection = nn.Sequential(
-            nn.Linear(self.global_feature_dim, common_dim),
-            nn.ReLU()
+        # Global projections - now handles multiple features like local
+        self.global_projections = nn.ModuleList(
+            [nn.Sequential(nn.Linear(dim, common_dim), nn.ReLU()) for dim in self.global_feature_dims]
         )
 
-        # 6. Final regression head
-        # Local: num_modalities * 5 scales * common_dim (each modality processed separately)
-        # Global: common_dim
-        local_channels = in_channels  # Account for all input modalities
-        total_features = local_channels * 5 * common_dim + common_dim
+        # 6. Balanced feature fusion for 50%-50% split
+        # Calculate dimensions for balanced representation
+        local_total_dim = in_channels * len(self.global_feature_dims) * common_dim
+        global_total_dim = len(self.global_feature_dims) * common_dim  # Now handles multiple global features
+
+        # Create balanced feature dimensions (50%-50% split)
+        balanced_dim = 128  # Total balanced feature dimension
+        local_balanced_dim = balanced_dim // 2  # 50% for local features
+        global_balanced_dim = balanced_dim // 2  # 50% for global features
+
+        # Projection layers to balance the features
+        self.local_balance_projection = nn.Sequential(
+            nn.Linear(local_total_dim, local_balanced_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1)
+        )
+
+        self.global_balance_projection = nn.Sequential(
+            nn.Linear(global_total_dim, global_balanced_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1)
+        )
+
+        # 7. Final regression head with balanced features
+        total_features = balanced_dim
 
         output_dim = 2 if self.hparams.predict_uncertainty else 1
         self.regression_head = nn.Sequential(
@@ -428,6 +500,13 @@ class RegressionHierarchicalFinetuner(pl.LightningModule):
         )
 
         self.val_corr = PearsonCorrCoef()
+
+        # Initialize combo loss
+        self.combo_loss = ComboLoss(
+            alpha=self.hparams.combo_alpha,
+            beta=self.hparams.combo_beta,
+            delta=self.hparams.combo_delta
+        )
 
         # Lists to store step outputs for logging
         self.training_step_outputs = []
@@ -671,31 +750,39 @@ class RegressionHierarchicalFinetuner(pl.LightningModule):
         # 2. Global encoder
         global_features = self.global_encoder(global_x)
 
-        # Handle different output types from global encoder
+        # Handle different output types from global encoder and process all features
         if isinstance(global_features, (list, tuple)):
-            global_features = global_features[0]  # Take first output if multiple
-
-        # Global adaptive pooling and projection
-        if len(global_features.shape) > 2:
-            global_pooled = self.global_pool(global_features).view(B, -1)
+            # Pool and project all global features (same as local processing)
+            global_pooled_features = [
+                self.global_projections[i](self.global_pools[i](features).view(B, -1))
+                for i, features in enumerate(global_features)
+            ]
+            global_multi_scale = torch.cat(global_pooled_features, dim=1)
         else:
-            global_pooled = global_features
+            # Handle single tensor case
+            if len(global_features.shape) > 2:
+                global_pooled = self.global_pools[0](global_features).view(B, -1)
+            else:
+                global_pooled = global_features
+            global_multi_scale = self.global_projections[0](global_pooled)
 
-        global_projected = self.global_projection(global_pooled)
+        # 3. Balance local and global features for 50%-50% representation
+        local_balanced = self.local_balance_projection(local_multi_scale)
+        global_balanced = self.global_balance_projection(global_multi_scale)
 
-        # 3. Concatenate local and global features
-        combined_features = torch.cat([local_multi_scale, global_projected], dim=1)
+        # 4. Concatenate balanced features (now 50%-50% contribution)
+        combined_features = torch.cat([local_balanced, global_balanced], dim=1)
 
-        # 4. Final regression
+        # 5. Final regression with balanced feature representation
         output = self.regression_head(combined_features)
 
         return output.squeeze(-1) if not self.hparams.predict_uncertainty else output
 
     def compute_loss(self, pred, target):
-        """Computes the Mean Absolute Error (L1 Loss)."""
+        """Computes the combo loss (Huber + Pearson + CCC)."""
         if self.hparams.predict_uncertainty:
             pred = pred[:, 0]
-        return F.l1_loss(pred, target)
+        return self.combo_loss(pred, target)
 
     def training_step(self, batch, batch_idx):
         targets = batch['label'].float().view(-1)
@@ -827,13 +914,20 @@ class RegressionHierarchicalFinetuner(pl.LightningModule):
 
         total_steps = self.trainer.estimated_stepping_batches
 
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        # scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        #     optimizer,
+        #     max_lr=self.hparams.learning_rate,
+        #     total_steps=total_steps,
+        #     pct_start=0.1,
+        #     anneal_strategy='cos',
+        # )
+
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            max_lr=self.hparams.learning_rate,
-            total_steps=total_steps,
-            pct_start=0.1,
-            anneal_strategy='cos',
+            T_max = self.trainer.estimated_stepping_batches, # Total number of training steps
+            eta_min = self.hparams.learning_rate / 50 # Go down to 2% of the max LR
         )
+
 
         return {
             'optimizer': optimizer,
