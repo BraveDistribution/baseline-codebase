@@ -588,6 +588,22 @@ def save_output_txt(number: float | int, output_path: str):
     with open(output_path, "w") as f:
         f.write(f"{number:.3f}")
 
+def get_multi_crop(image):
+    croppad = CropPad(patch_size=(96, 96, 96))
+    crops = []
+    for _ in range(2):
+        out = croppad(
+            packed_data_dict={"image": image},
+            image_properties={"foreground_locations": []}
+        )
+        cropped = out["image"].astype(np.float32, copy=False)
+        crops.append(cropped)
+
+    crops = np.array(crops)
+    torch_crops = torch.from_numpy(np.ascontiguousarray(crops))
+
+    return torch_crops
+
 def predict_from_config(
     modality_paths: List[str],
     predict_config: Dict[str, Any],
@@ -636,26 +652,24 @@ def predict_from_config(
     )
 
     x_np = case_preprocessed.squeeze(0).detach().numpy()
+    print(f"\nx_np shape: {np.shape(x_np)}")
+
+    # croppad = CropPad(patch_size=(96, 96, 96))
+    # out = croppad(
+    #     packed_data_dict={"image": x_np},
+    #     image_properties={"foreground_locations": []}
+    # )
+    # x_np = out["image"].astype(np.float32, copy=False)
+    # case_preprocessed = torch.from_numpy(np.ascontiguousarray(x_np)).unsqueeze(0)
 
 
-    croppad = CropPad(patch_size=(96, 96, 96))
-    out = croppad(
-        packed_data_dict={"image": x_np},
-        image_properties={"foreground_locations": []}
-    )
-    x_np = out["image"].astype(np.float32, copy=False)
-    case_preprocessed = torch.from_numpy(np.ascontiguousarray(x_np)).unsqueeze(0)
+    case_preprocessed = get_multi_crop(x_np)
+    print(f"\ncase_preprocessed shape: {case_preprocessed.shape}")
 
     # Load the model checkpoint directly with Lightning
 
-    model = ClassificationFinetuner2.load_from_pretrained(
-            checkpoint_path=str(model_path),
-            num_classes=1,
-            in_channels=4,
-            freeze_encoder=True,
-            learning_rate=1e-5, # We discussed using a lower LR for fine-tuning
-            max_epochs=50
-        )
+
+    model = ClassificationFinetuner2.load_from_checkpoint(str(model_path))
 
     # Set model to evaluation mode
     model.eval()
@@ -759,7 +773,7 @@ def main():
     # softmax output to get probability
     probabilities = sigmoid(predictions_original)
 
-    save_output_txt(float(probabilities), output_path)
+    save_output_txt(float(probabilities.mean()), output_path)
 
 
 if __name__ == "__main__":

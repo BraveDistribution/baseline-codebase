@@ -23,7 +23,7 @@ from yucca.modules.data.augmentation.transforms.cropping_and_padding import Crop
 
 import wandb
 import matplotlib.pyplot as plt
-from peft import LoraConfig, get_peft_model, get_peft_model, LoraConfig
+from peft import LoraConfig, get_peft_model, get_peft_model
 
 from pathlib import Path
 
@@ -404,11 +404,11 @@ class RegressionFinetuner3(pl.LightningModule):
         feature_size: int = 24,
         lora_r: int = 128,
         lora_alpha: int = 16,
-        learning_rate: float = 1e-3,
+        learning_rate: float = 1e-4,
         dropout_rate: float = 0.1,
         max_epochs: int = 500,
         predict_uncertainty: bool = False,
-        weight_decay: float = 0.01,
+        weight_decay: float = 1e-4,
         mixup_alpha: float = 0.4,          # Beta distribution α (0 disables MixUp)
         mixup_prob: float = 0.5,
         **kwargs,
@@ -461,11 +461,11 @@ class RegressionFinetuner3(pl.LightningModule):
 
         output_dim = 2 if self.hparams.predict_uncertainty else 1
         # self.regression_head = nn.Sequential(
-        #     nn.Linear(self.hparams.in_channels * 5 * common_dim, 64),
-        #     nn.LayerNorm(64),
+        #     nn.Linear(self.hparams.in_channels * 5 * common_dim, 128),
+        #     nn.LayerNorm(128),
         #     nn.ReLU(),
         #     nn.Dropout(self.hparams.dropout_rate),
-        #     nn.Linear(64, output_dim),
+        #     nn.Linear(128, output_dim),
         #     # IMPORTANT: No Sigmoid, as Z-score targets are unbounded
         # )
         self.regression_head = nn.Sequential(
@@ -552,7 +552,7 @@ class RegressionFinetuner3(pl.LightningModule):
         finetuner, and transfers the encoder weights.
         """
         print(f"Loading pretrained model from: {checkpoint_path}")
-        pretrain_model = ContrastiveTransformer.load_from_checkpoint(checkpoint_path, strict=False)
+        pretrain_model = ContrastiveTransformer.load_from_checkpoint(checkpoint_path)
 
         finetuner_hparams = pretrain_model.hparams
         finetuner_hparams.update(kwargs)
@@ -762,6 +762,7 @@ class RegressionFinetuner3(pl.LightningModule):
         return mixed_images, mixed_targets_norm, lam
 
 
+
 def unnormalize(x: torch.Tensor, target_mean: float, target_std: float) -> torch.Tensor:
     """Reverses Z-score normalization."""
     return x * target_std + target_mean
@@ -782,7 +783,6 @@ def load_modalities(modality_paths: List[str]) -> List[nib.Nifti1Image]:
 
 def save_output_txt(number: float | int, output_path: str):
     """Save a number (float or int) as plain text to a file."""
-
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
     if not output_path.endswith(".txt"):
@@ -790,6 +790,22 @@ def save_output_txt(number: float | int, output_path: str):
 
     with open(output_path, "w") as f:
         f.write(f"{number}")
+
+def get_multi_crop(image):
+    croppad = CropPad(patch_size=(96, 96, 96))
+    crops = []
+    for _ in range(10):
+        out = croppad(
+            packed_data_dict={"image": image},
+            image_properties={"foreground_locations": []}
+        )
+        cropped = out["image"].astype(np.float32, copy=False)
+        crops.append(cropped)
+
+    crops = np.array(crops)
+    torch_crops = torch.from_numpy(np.ascontiguousarray(crops))
+
+    return torch_crops
 
 def predict_from_config(
     modality_paths: List[str],
@@ -823,10 +839,6 @@ def predict_from_config(
     target_spacing = [1.0, 1.0, 1.0]  # Isotropic 1mm spacing
     target_orientation = "RAS"
 
-    test_image = images[0].get_fdata().astype(np.float32)
-    test_path = Path("output/task3_test/test_image_clean_1.npy")
-    np.save(test_path,test_image)
-
 
     # Apply preprocessing
     case_preprocessed, case_properties = preprocess_case_for_inference(
@@ -845,32 +857,13 @@ def predict_from_config(
 
     x_np = case_preprocessed.squeeze(0).detach().numpy()
 
-    test_path = Path("output/task3_test/test_image_1.npy")
-    np.save(test_path,x_np)
 
-    croppad = CropPad(patch_size=(96, 96, 96))
-    out = croppad(
-        packed_data_dict={"image": x_np},
-        image_properties={"foreground_locations": []}
-    )
-    x_np = out["image"].astype(np.float32, copy=False)
 
-    test_path = Path("output/task3_test/test_cropped_1.npy")
-    np.save(test_path,x_np)
-
-    case_preprocessed = torch.from_numpy(np.ascontiguousarray(x_np)).unsqueeze(0)
+    case_preprocessed = get_multi_crop(x_np)
 
     # Load the model checkpoint directly with Lightning
 
-    model = RegressionFinetuner3.load_from_pretrained(
-            checkpoint_path=str(model_path),
-            in_channels=2,
-            target_min=18.0,
-            target_max=120.0,
-            feature_size=24,
-            target_mean=61.87,
-            target_std=15.089118845634706,
-        )
+    model = RegressionFinetuner3.load_from_checkpoint(str(model_path))
 
     # Set model to evaluation mode
     model.eval()
@@ -922,7 +915,7 @@ predict_config = {
     # Import values from task_configs
     **task3_config,
     # Add inference-specific configs
-    "model_path": "/app/weights/brano_full_regression.ckpt",  # Path to model (inside container!)
+    "model_path": "/app/weights/brano_27_8.ckpt",  # Path to model (inside container!)
     "patch_size": (96, 96, 96),  # Patch size for inference
 }
 
@@ -955,8 +948,7 @@ def main():
         predict_config=predict_config,
     )
 
-    print(f"\n\n\n DATA PRED UNNORMALIZE: {predictions_original}, DATA PO: {int(unnormalize(predictions_original, target_mean=61.87, target_std=15.089118845634706))}")
-    save_output_txt(int(unnormalize(predictions_original, target_mean=61.87, target_std=15.089118845634706)), output_path)
+    save_output_txt(int(unnormalize(predictions_original, target_mean=61.87, target_std=15.089118845634706).mean()), output_path)
 
 
 if __name__ == "__main__":
