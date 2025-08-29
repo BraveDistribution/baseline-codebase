@@ -1247,7 +1247,7 @@ def predict_from_config(
 
     # Load the model checkpoint directly with Lightning
 
-    model = RegressionFinetuner3.load_from_checkpoint(str(model_path))
+    model = RegressionFinetuner4.load_from_checkpoint(str(model_path))
 
     # Set model to evaluation mode
     model.eval()
