@@ -13,7 +13,7 @@ from yucca.modules.data.augmentation.YuccaAugmentationComposer import (
     YuccaAugmentationComposer,
 )
 from yucca.pipeline.configuration.split_data import get_split_config
-from mato_models.models import ClassificationFineTuner, RegressionFineTuner, SegmentationFineTuner, ClassificationFinetuner2, RegressionFinetuner2, RegressionFinetuner3,  SegmentationProtoNet
+from mato_models.models import ClassificationFineTuner, RegressionFineTuner, SegmentationFineTuner, ClassificationFinetuner2, RegressionFinetuner2, RegressionFinetuner3,  SegmentationProtoNet, RegressionFinetuner4
 from yucca.modules.data.data_modules.YuccaDataModule import YuccaDataModule
 from yucca.modules.callbacks.loggers import YuccaLogger
 from yucca.modules.data.datasets.YuccaDataset import YuccaTrainDataset
@@ -384,13 +384,14 @@ def train(
     num_workers: int = 12,
     experiment_name: str = "Classification Finetuning",
     task_type: str = "classification",
+    n_splits: int = 0,
 ):
     print("--- Training Parameters ---")
     for key, value in locals().items():
         print(f"{key:<20}: {value}")
     print("--------------------------")
     if split_method == "kfold":
-        split_param = int(split_param)
+        split_param = n_splits
     elif split_method == "simple_train_val_split":
         split_param = float(split_param)
     else:
@@ -407,7 +408,7 @@ def train(
 
     monitor = "val/loss"
     if split_param < 0.05:
-        monitor = "train/loss"
+        monitor = "val/loss"
     checkpoint_callback = ModelCheckpoint(
         dirpath=save_checkpoint_dir,
         filename="best-checkpoint-{task_type}-{val_loss:.4f}",
@@ -452,11 +453,11 @@ def train(
         val_sampler=None,
     )
 
-    if task_type == 'regression111':
+    if task_type == 'regression':
         data_module = add_age_balancing_to_existing_datamodule(
             data_module,  # ← Use the variable you created
             age_balance_config={
-                'num_bins': 6,
+                'num_bins': 10,
                 'strategy': 'smooth',
                 'temperature': 0.85
             }
@@ -496,7 +497,7 @@ def train(
         #     max_epochs=50,
         #     strict=False
         # )
-        model = RegressionFinetuner3.load_from_pretrained(
+        model = RegressionFinetuner4.load_from_pretrained(
             checkpoint_path=str(model_checkpoint),
             in_channels=2,
             target_min=18.0,
@@ -527,10 +528,10 @@ def train(
         limit_train_batches=30,
         accumulate_grad_batches=5,
         log_every_n_steps=15,
-        check_val_every_n_epoch=3,
+        # check_val_every_n_epoch=100,
         gradient_clip_val=1.0,
-        # num_sanity_val_steps=0,  # Skip validation sanity check
-        # check_val_every_n_epoch=None,  # Disable validation entirely
+        num_sanity_val_steps=0,  # Skip validation sanity check
+        check_val_every_n_epoch=None,  # Disable validation entirely
     )
     trainer.fit(model, datamodule=data_module)
 

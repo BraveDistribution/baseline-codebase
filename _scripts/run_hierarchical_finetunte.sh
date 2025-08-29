@@ -37,5 +37,4 @@ python src/finetune_hierarchical.py \
     --batch_size 4 \
     --experiment_name Hierarchical_finetune \
     --learning_rate 1e-4 \
-    --freeze_global_encoder \
     --precision bf16-mixed

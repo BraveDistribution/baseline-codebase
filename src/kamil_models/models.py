@@ -462,7 +462,7 @@ class RegressionHierarchicalFinetuner(pl.LightningModule):
 
         # 6. Balanced feature fusion for 50%-50% split
         # Calculate dimensions for balanced representation
-        local_total_dim = in_channels * len(self.global_feature_dims) * common_dim
+        local_total_dim = in_channels * len(self.local_feature_dims) * common_dim  # Fixed: use local_feature_dims
         global_total_dim = len(self.global_feature_dims) * common_dim  # Now handles multiple global features
 
         # Create balanced feature dimensions (50%-50% split)
@@ -562,7 +562,9 @@ class RegressionHierarchicalFinetuner(pl.LightningModule):
             for key, value in state_dict.items():
                 # Remove common prefixes to match the global encoder structure
                 clean_key = key
-                if key.startswith('model.'):
+                if key.startswith('model.encoder.'):
+                    clean_key = key[14:]  # Remove 'model.encoder.'
+                elif key.startswith('model.'):
                     clean_key = key[6:]  # Remove 'model.'
                 elif key.startswith('encoder.'):
                     clean_key = key[8:]  # Remove 'encoder.'
@@ -769,6 +771,15 @@ class RegressionHierarchicalFinetuner(pl.LightningModule):
         # 3. Balance local and global features for 50%-50% representation
         local_balanced = self.local_balance_projection(local_multi_scale)
         global_balanced = self.global_balance_projection(global_multi_scale)
+
+        # Debug: Check feature norms to understand contribution balance
+        if self.training and torch.rand(1).item() < 0.01:  # 1% chance to log during training
+            local_norm = torch.norm(local_balanced, dim=1).mean().item()
+            global_norm = torch.norm(global_balanced, dim=1).mean().item()
+            local_var = torch.var(local_balanced, dim=1).mean().item()
+            global_var = torch.var(global_balanced, dim=1).mean().item()
+            print(f"Feature balance - Local norm: {local_norm:.3f}, Global norm: {global_norm:.3f}")
+            print(f"Feature variance - Local var: {local_var:.3f}, Global var: {global_var:.3f}")
 
         # 4. Concatenate balanced features (now 50%-50% contribution)
         combined_features = torch.cat([local_balanced, global_balanced], dim=1)

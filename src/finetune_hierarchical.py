@@ -34,6 +34,7 @@ Date: August 2025
 import os
 import argparse
 import logging
+import torch
 import pytorch_lightning as pl
 from typing import Dict, Any
 
@@ -439,6 +440,35 @@ def setup_experiment_directory(config: HierarchicalConfig) -> tuple[str, int]:
     return version_dir, version
 
 
+def setup_deterministic_training():
+    """
+    Set up deterministic training configuration that handles CUDA operations
+    without deterministic implementations.
+
+    The SwinUNETR model uses max_pool3d operations which don't have deterministic
+    CUDA implementations. This function enables deterministic algorithms with
+    warn_only=True to allow training while maintaining reproducibility for
+    supported operations.
+    """
+    try:
+        # Enable deterministic algorithms with warnings for operations that don't support it
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        print("✓ Deterministic algorithms enabled with warnings for unsupported operations")
+        return True
+    except Exception as e:
+        print(f"⚠️  Could not enable deterministic algorithms: {e}")
+
+        # Fallback: Set up partial deterministic behavior
+        try:
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+            print("✓ Fallback: Set CUDNN deterministic mode")
+            return False
+        except Exception as e2:
+            print(f"⚠️  Could not set CUDNN deterministic mode: {e2}")
+            return False
+
+
 def train_hierarchical_model(config: HierarchicalConfig):
     """
     Main training function for hierarchical models.
@@ -453,9 +483,12 @@ def train_hierarchical_model(config: HierarchicalConfig):
     version_dir, version = setup_experiment_directory(config)
     print(f"\n📁 Experiment directory: {version_dir}")
 
-    # Set up reproducibility
+    # Set up reproducibility and deterministic training
     seed = setup_seed(config.continue_training)
     print(f"🌱 Using seed: {seed}")
+
+    # Set up deterministic algorithms with proper handling for CUDA operations
+    deterministic_enabled = setup_deterministic_training()
 
     # Look for existing checkpoint if continuing training
     ckpt_path = find_checkpoint(version_dir, config.continue_training) if config.continue_training else None
@@ -503,7 +536,7 @@ def train_hierarchical_model(config: HierarchicalConfig):
         log_every_n_steps=max(1, config.train_batches_per_epoch // 10),  # Log 10 times per epoch
         enable_progress_bar=True,
         enable_model_summary=True,
-        deterministic=True,
+        deterministic=deterministic_enabled,
         enable_checkpointing=True,
     )
 
