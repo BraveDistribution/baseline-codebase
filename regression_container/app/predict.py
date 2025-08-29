@@ -761,6 +761,390 @@ class RegressionFinetuner3(pl.LightningModule):
 
         return mixed_images, mixed_targets_norm, lam
 
+class RegressionFinetuner4(pl.LightningModule):
+    """
+    EARLY FUSION CONFIGURATION:
+    - Encoder: Accepts in_channels directly (e.g., 2 for two modalities).
+    - Forward Pass: Processes multi-channel input in a single pass.
+    - Architecture: Fully trainable encoder (no LoRA/PEFT). Uses the final feature map for regression.
+    - Normalization: Uses a robust log-transform (log1p) + Z-score.
+    - Loss: Uses a simple and stable L1 (MAE) loss, with an added loss for Brain Age Gap (BAG) correlation.
+    """
+    def __init__(
+        self,
+        in_channels: int,        # Set to 2 for two modalities
+        target_mean: float,      # IMPORTANT: Mean of the LOG-TRANSFORMED training ages
+        target_std: float,       # IMPORTANT: Std dev of the LOG-TRANSFORMED training ages
+        img_size: Tuple[int, int, int] = (96, 96, 96),
+        feature_size: int = 24,
+        learning_rate: float = 1e-4,
+        dropout_rate: float = 0.1,
+        predict_uncertainty: bool = False,
+        weight_decay: float = 1e-5,
+        bag_loss_weight: float = 0.1,
+        **kwargs,
+    ):
+        super().__init__()
+        # Note: lora_r and lora_alpha are ignored but kept in signature for compatibility
+        self.save_hyperparameters()
+        self.register_buffer("bias_a", torch.tensor(1.0))
+        self.register_buffer("bias_b", torch.tensor(0.0))
+        self.best_val_mae = float("inf")
+        self.best_bias_epoch = -1
+        self.training_step_outputs = []
+        self.validation_step_outputs = []
+        self.all_train_targets_for_plot = None
+        self.has_logged_train_batch = False
+        self.has_logged_val_batch = False
+
+        self.register_buffer("target_mean", torch.tensor(target_mean))
+        self.register_buffer("target_std", torch.tensor(target_std))
+
+        self.train_bag_corr_metric = None
+        self.val_corr = None
+
+        # --- MODEL ARCHITECTURE ---
+
+        # 1. Base Encoder - Accepts multiple input channels for early fusion.
+        self.encoder = SwinUNETR(
+            in_channels=self.hparams.in_channels, # Changed from 1
+            out_channels=1,
+            feature_size=self.hparams.feature_size,
+            use_checkpoint=True,
+            use_v2=True,
+        )
+        # NOTE: LoRA wrapper has been removed. The entire encoder is now trainable.
+
+        # 2. Define Regression Head
+        with torch.no_grad():
+            # Dummy input now reflects the multi-channel input
+            dummy_input = torch.zeros(1, self.hparams.in_channels, *self.hparams.img_size)
+            all_features = self.encoder.swinViT(dummy_input)
+            final_feature_dim = all_features[-1].shape[1]
+
+        self.pool = nn.AdaptiveAvgPool3d(1)
+
+        # Input to the head is the feature dimension from the single forward pass.
+        regressor_input_dim = final_feature_dim # Changed from self.hparams.in_channels * final_feature_dim
+
+        output_dim = 2 if self.hparams.predict_uncertainty else 1
+        self.regression_head = nn.Sequential(
+            nn.Linear(regressor_input_dim, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            nn.Dropout(self.hparams.dropout_rate),
+            nn.Linear(256, output_dim),
+        )
+
+    def setup(self, stage: str):
+        """Initializes metrics after the model has been moved to the correct device."""
+        if self.train_bag_corr_metric is None:
+            self.train_bag_corr_metric = PearsonCorrCoef().to(self.device)
+        if self.val_corr is None:
+            self.val_corr = PearsonCorrCoef().to(self.device)
+            self.val_bag_corr_metric = PearsonCorrCoef().to(self.device)
+
+    def _log_batch_images(self, images, targets, preds, step_name: str):
+        """Creates and logs a grid of image slices for a few samples in the batch."""
+        if not self.logger:
+            return
+
+        images = images.detach().cpu().numpy()
+        targets = targets.detach().cpu().numpy()
+        preds = preds.detach().cpu().numpy()
+        num_samples = min(4, len(images))
+
+        for i in range(num_samples):
+            image = images[i]
+            target = targets[i]
+            pred = preds[i]
+            num_modalities = image.shape[0]
+            fig, axes = plt.subplots(num_modalities, 3, figsize=(12, 4 * num_modalities), squeeze=False)
+            fig.suptitle(f"Sample {i} | True Age: {target:.1f} | Pred Age: {pred:.1f}", fontsize=16)
+
+            for c in range(num_modalities):
+                modality_vol = image[c]
+                mid_d, mid_h, mid_w = [s // 2 for s in modality_vol.shape]
+                axial_slice = modality_vol[mid_d, :, :]
+                coronal_slice = modality_vol[:, mid_h, :]
+                sagittal_slice = modality_vol[:, :, mid_w]
+
+                axes[c, 0].imshow(axial_slice.T, cmap="bone", origin="lower")
+                axes[c, 0].set_title(f"Modality {c} (Axial)")
+                axes[c, 0].axis("off")
+                axes[c, 1].imshow(coronal_slice.T, cmap="bone", origin="lower")
+                axes[c, 1].set_title(f"Modality {c} (Coronal)")
+                axes[c, 1].axis("off")
+                axes[c, 2].imshow(sagittal_slice.T, cmap="bone", origin="lower")
+                axes[c, 2].set_title(f"Modality {c} (Sagittal)")
+                axes[c, 2].axis("off")
+
+            plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+            self.logger.experiment.log({
+                f"{step_name}/batch_visualization_{i}": wandb.Image(fig)
+            })
+            plt.close(fig)
+
+    @classmethod
+    def load_from_pretrained(
+        cls,
+        checkpoint_path: str,
+        in_channels: int,
+        target_mean: float,
+        target_std: float,
+        original_target_mean: float,
+        **kwargs
+    ):
+        """
+        Loads a pretrained ContrastiveTransformer, creates an instance of this
+        finetuner, and transfers the encoder weights.
+        """
+        print(f"Loading pretrained model from: {checkpoint_path}")
+        pretrain_model = ContrastiveTransformer.load_from_checkpoint(checkpoint_path)
+
+        finetuner_hparams = pretrain_model.hparams
+        finetuner_hparams.update(kwargs)
+        finetuner_hparams['in_channels'] = in_channels
+        finetuner_hparams['target_mean'] = target_mean
+        finetuner_hparams['target_std'] = target_std
+        finetuner_hparams['original_target_mean'] = original_target_mean
+
+        model = cls(**finetuner_hparams)
+        print("\nFinetuner instantiated. Now transferring weights...")
+
+        src_dict = pretrain_model.encoder.swinViT.state_dict()
+        dst_dict = model.encoder.swinViT.state_dict() # Adjusted for direct encoder access
+
+        filtered_state_dict = {
+            k: v for k, v in src_dict.items()
+            if k in dst_dict and v.shape == dst_dict[k].shape
+        }
+
+        msg = model.encoder.swinViT.load_state_dict(filtered_state_dict, strict=False)
+
+        print(f"\n✓ Loaded {len(filtered_state_dict)} swinViT tensors from {checkpoint_path}")
+        print(f"  Missing keys: {len(msg.missing_keys)} | Unexpected keys: {len(msg.unexpected_keys)}")
+
+        # LoRA-specific prints removed
+        num_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"\nTotal trainable parameters: {num_trainable:,}")
+
+        return model
+
+    def _normalize(self, x: torch.Tensor) -> torch.Tensor:
+        """Applies Log Transform, then Z-score normalization."""
+        eps = 1e-6
+        x_transformed = torch.log1p(x)
+        return (x_transformed - self.target_mean) / (self.target_std + eps)
+
+    def _unnormalize(self, x: torch.Tensor) -> torch.Tensor:
+        """Reverses Z-score normalization, then inverse Log Transform."""
+        x_transformed = x * self.target_std + self.target_mean
+        return torch.expm1(x_transformed)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, D, H, W = x.shape
+
+        # --- EARLY FUSION LOGIC ---
+        # The encoder now handles the multi-channel input directly.
+        # Input shape: [B, C, D, H, W]
+        all_features = self.encoder.swinViT(x)
+
+        # Use ONLY the final, most abstract feature map
+        final_features = all_features[-1]
+
+        # Pool features. Shape is now [B, feature_dim, 1, 1, 1]
+        pooled_features = self.pool(final_features)
+
+        # Flatten for the regression head.
+        # Shape: [B, feature_dim]
+        flattened_features = pooled_features.view(B, -1)
+
+        output = self.regression_head(flattened_features)
+        # --- END FUSION LOGIC ---
+
+        return output.squeeze(-1) if not self.hparams.predict_uncertainty else output
+
+    def compute_loss(self, preds_original, targets_original):
+        mae_loss = F.l1_loss(preds_original, targets_original)
+        bag = preds_original - targets_original
+
+        # Manual correlation for gradient flow
+        bag_mean, targets_mean = bag.mean(), targets_original.mean()
+        bag_centered, targets_centered = bag - bag_mean, targets_original - targets_mean
+
+        numerator = (bag_centered * targets_centered).sum()
+        denominator = torch.sqrt((bag_centered ** 2).sum() * (targets_centered ** 2).sum())
+        correlation = numerator / (denominator + 1e-8)
+
+        bag_correlation_loss = torch.abs(correlation)
+        total_loss = mae_loss + self.hparams.bag_loss_weight * bag_correlation_loss
+
+        return total_loss, mae_loss, bag_correlation_loss
+
+    def training_step(self, batch, batch_idx):
+        images, targets = batch['image'], batch['label'].float().view(-1)
+
+        preds_normalized = self(images)
+        preds_mean_normalized = preds_normalized[:, 0] if self.hparams.predict_uncertainty else preds_normalized
+        preds_original = self._unnormalize(preds_mean_normalized)
+
+        targets_normalized = self._normalize(targets)
+
+        total_loss, mae_loss, bag_corr_loss = self.compute_loss(preds_original, targets)
+
+        self.log('train/loss', total_loss, on_step=False, on_epoch=True, sync_dist=True)
+        self.log('train/mae_loss', mae_loss, on_step=False, on_epoch=True, sync_dist=True)
+        self.log('train/bag_corr_loss', bag_corr_loss, on_step=False, on_epoch=True, sync_dist=True)
+
+        self.training_step_outputs.append(targets.detach().cpu())
+        return total_loss
+
+    def validation_step(self, batch, batch_idx):
+        images, targets = batch['image'], batch['label'].float().view(-1)
+        preds_normalized = self(images)
+
+        preds_mean_normalized = preds_normalized[:, 0] if self.hparams.predict_uncertainty else preds_normalized
+        preds_original = self._unnormalize(preds_mean_normalized.detach())
+        mae = F.l1_loss(preds_original, targets)
+
+        self.val_corr.update(preds_original, targets)
+
+        bag = preds_original - targets
+        self.val_bag_corr_metric.update(bag, targets)
+
+        log_dict = {
+            'val/mae': mae, 'val/correlation': self.val_corr, 'val/bag_corr': self.val_bag_corr_metric, 'val/loss': mae,
+        }
+        self.log_dict(log_dict, prog_bar=True, on_epoch=True, sync_dist=True)
+        self.validation_step_outputs.append({'preds': preds_original, 'targets': targets})
+
+    def configure_optimizers(self):
+        # All parameters are now trainable since LoRA is removed
+        optimizer = torch.optim.AdamW(
+            self.parameters(),
+            lr=self.hparams.learning_rate,
+            weight_decay=self.hparams.weight_decay
+        )
+
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max = self.trainer.estimated_stepping_batches,
+            eta_min = self.hparams.learning_rate / 50
+        )
+
+        return {
+            'optimizer': optimizer,
+            'lr_scheduler': {
+                'scheduler': scheduler,
+                'interval': 'step'
+            }
+        }
+
+    # on_train_epoch_end, on_validation_epoch_end, _maybe_mixup, and apply_bias_correction
+    # methods are unchanged and can be copied directly from your original code.
+    # For brevity, I am omitting them here, but they should be included in your final class definition.
+
+    def on_train_epoch_end(self):
+        """Aggregates training labels at the end of the training epoch."""
+        if self.training_step_outputs:
+            self.all_train_targets_for_plot = torch.cat(self.training_step_outputs).numpy()
+            self.training_step_outputs.clear()
+
+    def on_validation_epoch_end(self):
+        if self.trainer.sanity_checking or not self.validation_step_outputs:
+            return
+
+        preds = torch.cat([x['preds'] for x in self.validation_step_outputs], dim=0)
+        targets = torch.cat([x['targets'] for x in self.validation_step_outputs], dim=0)
+
+        if self.trainer.world_size > 1:
+            preds = self.all_gather(preds).reshape(-1)
+            targets = self.all_gather(targets).reshape(-1)
+
+        x = preds.detach()
+        y = targets.detach()
+        x_mean, y_mean = x.mean(), y.mean()
+        x_var  = x.var(unbiased=False)
+
+        if x_var < 1e-8:
+            a = torch.tensor(1.0, device=x.device)
+            b = torch.tensor(0.0, device=x.device)
+        else:
+            cov = ((x - x_mean) * (y - y_mean)).mean()
+            a = cov / (x_var + 1e-8)
+            b = y_mean - a * x_mean
+
+        mae_raw = F.l1_loss(x, y)
+        x_corr = a * x + b
+        mae_corr = F.l1_loss(x_corr, y)
+        bag = x_corr - y
+        bag_centered = bag - bag.mean()
+        y_centered = y - y.mean()
+        denom = torch.sqrt((bag_centered.pow(2).sum()) * (y_centered.pow(2).sum())) + 1e-8
+        bag_r = (bag_centered * y_centered).sum() / denom
+
+        if self.trainer.is_global_zero:
+            if mae_corr.item() < self.best_val_mae:
+                self.best_val_mae = mae_corr.item()
+                self.bias_a.copy_(a.detach())
+                self.bias_b.copy_(b.detach())
+                self.best_bias_epoch = int(self.current_epoch)
+
+            self.log_dict({
+                "val/mae_raw_epoch": mae_raw,
+                "val/mae_corr_epoch": mae_corr,
+                "val/bag_corr_after": bag_r,
+                "val/bias_a_epoch": a,
+                "val/bias_b_epoch": b,
+                "val/best_mae_corr": torch.tensor(self.best_val_mae, device=a.device),
+            }, prog_bar=False, on_epoch=True, sync_dist=True)
+
+            if self.logger:
+                self.logger.log_metrics({
+                    "val/best_bias_epoch": self.best_bias_epoch
+                }, step=self.global_step)
+
+        if self.logger and self.trainer.is_global_zero:
+            preds_np, targets_np = x.detach().cpu().numpy(), y.detach().cpu().numpy()
+            fig, ax1 = plt.subplots(figsize=(12, 7))
+            min_val, max_val = targets_np.min(), targets_np.max()
+            if self.all_train_targets_for_plot is not None:
+                min_val = min(min_val, self.all_train_targets_for_plot.min())
+                max_val = max(max_val, self.all_train_targets_for_plot.max())
+            bins = np.linspace(min_val, max_val, num=50)
+            ax1.hist(targets_np, bins=bins, alpha=0.6, color="blue", label="Ground Truth (Val)", density=True)
+            if self.all_train_targets_for_plot is not None:
+                ax1.hist(self.all_train_targets_for_plot, bins=bins, alpha=0.8, histtype='step',
+                         linewidth=1.5, color="green", label="Ground Truth (Train)", density=True)
+            ax1.hist(preds_np, bins=bins, alpha=0.5, color="red", label="Predictions (Val)", density=True)
+            ax1.set_title(f"Label Distributions & Predictions (Epoch {self.current_epoch})")
+            ax1.set_xlabel("Value"); ax1.set_ylabel("Density")
+            ax1.legend(); ax1.grid(True, alpha=0.3)
+            self.logger.experiment.log({
+                "validation/prediction_distribution": wandb.Image(fig)
+            })
+            plt.close(fig)
+
+        self.validation_step_outputs.clear()
+        self.all_train_targets_for_plot = None
+
+    def _maybe_mixup(self, images: torch.Tensor, targets_norm: torch.Tensor):
+        alpha = float(self.hparams.mixup_alpha)
+        p = float(self.hparams.mixup_prob)
+        if (not self.training) or alpha <= 0.0 or torch.rand(1, device=images.device).item() > p:
+            return images, targets_norm, None
+        lam = torch.distributions.Beta(alpha, alpha).sample().to(images.device)
+        lam = torch.maximum(lam, 1.0 - lam)
+        B = images.size(0)
+        index = torch.randperm(B, device=images.device)
+        mixed_images = lam * images + (1.0 - lam) * images[index]
+        mixed_targets_norm = lam * targets_norm + (1.0 - lam) * targets_norm[index]
+        return mixed_images, mixed_targets_norm, lam
+
+    def apply_bias_correction(self, yhat: torch.Tensor) -> torch.Tensor:
+        return self.bias_a * yhat + self.bias_b
+
 
 
 def unnormalize(x: torch.Tensor, target_mean: float, target_std: float) -> torch.Tensor:
@@ -915,7 +1299,7 @@ predict_config = {
     # Import values from task_configs
     **task3_config,
     # Add inference-specific configs
-    "model_path": "/app/weights/brano_27_8.ckpt",  # Path to model (inside container!)
+    "model_path": "/app/weights/brano_29_8.ckpt",  # Path to model (inside container!)
     "patch_size": (96, 96, 96),  # Patch size for inference
 }
 
