@@ -381,10 +381,11 @@ def train(
     split_method: str = "simple_train_val_split",
     split_param: float = 0.2,  # Use all data for training
     split_idx: int = 0,
-    num_workers: int = 12,
+    num_workers: int = 6,
     experiment_name: str = "Classification Finetuning",
     task_type: str = "classification",
     n_splits: int = 0,
+    aug_setup: str = "basic",
 ):
     print("--- Training Parameters ---")
     for key, value in locals().items():
@@ -411,14 +412,16 @@ def train(
         monitor = "val/loss"
     checkpoint_callback = ModelCheckpoint(
         dirpath=save_checkpoint_dir,
-        filename="best-checkpoint-{task_type}-{val_loss:.4f}",
+        filename="best-checkpoint-{task_type}-{val/loss:.4f}",
         monitor=monitor,
         mode="min",
         save_top_k=5,
         save_last=True,
     )
     # aug_params = get_finetune_augmentation_params("all")
-    aug_params = get_finetune_augmentation_params("basic")
+    if aug_setup not in ['basic','all']:
+        raise AttributeError("Invalid augmentation setup")
+    aug_params = get_finetune_augmentation_params(aug_setup)
     # aug_params["crop"] = True
     # aug_params["random_crop"] = False
     task_type_preset = "classification" if task_type == "regression" else task_type
@@ -487,25 +490,25 @@ def train(
         #     learning_rate=1e-4,
         #     max_epochs=50,
         # )
-        # model = ClassificationFinetuner2.load_from_pretrained(
-        #     checkpoint_path=str(model_checkpoint),
-        #     num_classes=1,
-        #     in_channels=num_modalities,
-        #     freeze_encoder=False,
-        #     learning_rate=1e-4, # We discussed using a lower LR for fine-tuning
-        #     max_epochs=50
-        # )
-        model = ClassificationFinetunerMTL.load_from_pretrained(
+        model = ClassificationFinetuner2.load_from_pretrained(
             checkpoint_path=str(model_checkpoint),
-            img_size=(96, 96, 96),
-            num_classes=2,
-            in_channels=4,
-            feature_size=24,
-            backbone_lr=2e-5,
-            head_lr=2e-4,
-            cls_loss_weight=1.0,
-            seg_loss_weight=0.5
+            num_classes=1,
+            in_channels=num_modalities,
+            freeze_encoder=False,
+            learning_rate=1e-4, # We discussed using a lower LR for fine-tuning
+            max_epochs=50
         )
+        # model = ClassificationFinetunerMTL.load_from_pretrained(
+        #     checkpoint_path=str(model_checkpoint),
+        #     img_size=(96, 96, 96),
+        #     num_classes=2,
+        #     in_channels=4,
+        #     feature_size=24,
+        #     backbone_lr=2e-5,
+        #     head_lr=2e-4,
+        #     cls_loss_weight=1.0,
+        #     seg_loss_weight=0.5
+        # )
     elif task_type == "regression":
         # model = RegressionFinetuner2.load_from_checkpoint(
         #     str(model_checkpoint),

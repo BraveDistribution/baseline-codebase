@@ -8,13 +8,10 @@ import torch
 from torch.nn.functional import sigmoid
 from typing import List, Dict, Any, Tuple, Sequence, Literal
 from monai.networks.nets.swin_unetr import SwinUNETR
-import math
 import nibabel as nib
 import numpy as np
 
 import SimpleITK as sitk
-import pickle
-import itertools
 
 import sys
 
@@ -24,17 +21,11 @@ from yucca.functional.preprocessing import (
 )
 
 from torchmetrics.regression import PearsonCorrCoef
-
 from yucca.modules.data.augmentation.transforms.cropping_and_padding import CropPad
-
+from peft import LoraConfig, get_peft_model
 import wandb
-import matplotlib.pyplot as plt
-from peft import LoraConfig, get_peft_model, get_peft_model
-
 from pytorch_lightning.loggers import WandbLogger
-
-from pathlib import Path
-
+import matplotlib.pyplot as plt
 from yucca.modules.networks.networks.YuccaNet import YuccaNet
 
 def generate_random_mask(
@@ -2078,25 +2069,9 @@ def save_output_txt(number: float | int, output_path: str):
     with open(output_path, "w") as f:
         f.write(f"{number}")
 
-def get_multi_crop(image):
-    croppad = CropPad(patch_size=(96, 96, 96))
-    crops = []
-    for _ in range(1):
-        out = croppad(
-            packed_data_dict={"image": image},
-            image_properties={"foreground_locations": []}
-        )
-        cropped = out["image"].astype(np.float32, copy=False)
-        crops.append(cropped)
-
-    crops = np.array(crops)
-    torch_crops = torch.from_numpy(np.ascontiguousarray(crops))
-
-    return torch_crops
-
 def resample_image_3d(img_data_3d, target_spacing, current_spacing=None):
     """
-    Resample a 3D NIfTI image to a target spacing using SimpleITK.
+    Resample a 3D image to a target spacing using SimpleITK.
 
     Args:
         img_data_3d (np.ndarray): 3D image data array
@@ -2191,195 +2166,30 @@ def process_3d_volume(volume_3d, target_spacing, current_spacing_3d, target_shap
 
     return result_volume
 
-def get_3d_spacing_from_metadata(current_spacing, img_shape):
-    """
-    Extract 3D spacing from metadata, handling cases where spacing might have more or fewer dimensions.
+def img_preprocess_for_global_branch(
+    img_npy: np.ndarray,
+    img_props: dict,
+    target_spacing: float = 2.6667,
+    target_shape: tuple = (96, 96, 96),
+    target_element_type: str = 'float16'
+)-> np.ndarray:
 
-    Args:
-        current_spacing (list): Current spacing from metadata
-        img_shape (tuple): Shape of the image array
+    if not img_npy:
+        raise ValueError("Missing image to process.")
 
-    Returns:
-        list: 3D spacing for the last 3 dimensions
-    """
-    if len(current_spacing) >= 3:
-        # Use the last 3 elements for 3D spacing
-        return current_spacing[-3:]
-    elif len(current_spacing) == len(img_shape):
-        # Use the last 3 elements if spacing matches image dimensions
-        return current_spacing[-3:]
-    else:
-        # Default to isotropic spacing
-        return [1.0, 1.0, 1.0]
+    if target_element_type not in ("float16", "float32", "float64"):
+        raise ValueError(f"Unsupported target element type: {target_element_type}")
 
-def unify_dataset_shape(
-    images: List[nib.Nifti1Image],
-    target_spacing: float = 1.0,
-    target_shape: tuple = None,
-    target_element_type: str = None,
-    do_conversion: bool = False
-):
-    """
-    Find the maximum size in each dimension so that all the images fits in and
-    unify the shape of all images in the dataset to that common size.
-    Place the sample in the center of the image and fill the empty space with zeros by padding.
-    Save the unified images to the destination directory while preserving the original subfolders structure.
-    Resample the images to the specified target spacing using metadata from pickle files.
+    data_type = target_element_type
+    # bytes_per_element = {"float16": 2, "float32": 4, "float64": 8}[data_type]
 
-    This function supports multi-dimensional arrays by iterating through higher dimensions
-    and applying the unifying process to each 3D volume defined by the last three dimensions.
-    For arrays with more than 3 dimensions, the function preserves the higher dimensions
-    and processes each 3D spatial volume independently.
+    current_spacing = img_props["nifti_metadata"]["original_spacing"]
 
-    This function assumes that the images are in npy format with corresponding pkl metadata files.
-    It will also create the destination directory if it does not exist.
+    resampled = process_3d_volume(
+        img_npy, target_spacing, current_spacing, target_shape, data_type
+    )
 
-    Args:
-        images (List[nib.Nifti1Image]): Output of load_modalities().
-        target_spacing (float): The target spacing to resample the images to.
-        target_shape (tuple): Target shape for the spatial (last 3) dimensions only.
-                             For multi-dimensional data, this should be a 3-tuple.
-        target_element_type (str): Target data type for output arrays.
-        do_conversion (bool): Whether to perform the actual conversion or just analysis.
-    """
-
-    if not images:
-        raise ValueError("No images provided to unify_dataset_shape().")
-
-    # Choose dtype
-    if target_element_type is None:
-        first_arr = np.asanyarray(images[0].get_fdata())
-        data_type = str(first_arr.dtype)
-        if data_type not in ("float16", "float32", "float64"):
-            data_type = "float32"
-    else:
-        if target_element_type not in ("float16", "float32", "float64"):
-            raise ValueError(f"Unsupported target element type: {target_element_type}")
-        data_type = target_element_type
-
-    bytes_per_element = {"float16": 2, "float32": 4, "float64": 8}[data_type]
-
-    # -------- Analysis pass: compute max shape after resampling --------
-    max_shape = None
-    resampled_shapes = []
-
-    for img in images:
-        arr = np.asanyarray(img.get_fdata())  # nib gives (X, Y, Z, [L1, L2, ...]) typically
-
-        if arr.ndim < 3:
-            print(f"Warning: image has fewer than 3 dims ({arr.ndim}). Skipping.")
-            continue
-
-        # Move spatial to last three as (… , Z, Y, X)
-        if arr.ndim == 3:
-            arr_lyx = np.transpose(arr, (2, 1, 0))  # (Z, Y, X)
-            leading_shape = ()
-        else:
-            lead_axes = list(range(3, arr.ndim))
-            arr_lyx = np.transpose(arr, lead_axes + [2, 1, 0])  # (L..., Z, Y, X)
-            leading_shape = arr_lyx.shape[:-3]
-
-        # Spacing from nib is (sx, sy, sz) → match to (Z,Y,X)
-        sx, sy, sz = img.header.get_zooms()[:3]
-        spacing_zyx = (sz, sy, sx)
-        spatial_size_zyx = arr_lyx.shape[-3:]
-
-        # Predict resampled spatial dims at target_spacing
-        resampled_size_zyx = tuple(
-            int(round(size * (sp / float(target_spacing))))
-            for size, sp in zip(spatial_size_zyx, spacing_zyx)
-        )
-        full_shape = leading_shape + resampled_size_zyx
-        resampled_shapes.append(full_shape)
-
-        if max_shape is None:
-            max_shape = full_shape
-        else:
-            # elementwise max across all dims (leading dims must match across modalities)
-            max_shape = tuple(max(a, b) for a, b in itertools.zip_longest(full_shape, max_shape, fillvalue=1))
-
-    print(f"Maximum resampled shape: {max_shape}")
-    print(f"Requested target shape: {target_shape}")
-
-    if target_shape is not None:
-        if len(target_shape) != 3:
-            raise ValueError(f"target_shape must be a 3-tuple (Z,Y,X), got {len(target_shape)} dims")
-        # Replace spatial dims
-        max_shape_spatial = max_shape[-3:]
-        full_target_shape = max_shape[:-3] + tuple(target_shape)
-        max_shape = full_target_shape
-
-        for dim, (t, m) in enumerate(zip(target_shape, max_shape_spatial)):
-            if t < m:
-                print(f"  Spatial dim {dim}: Will crop from {m} to {t}")
-            elif t > m:
-                print(f"  Spatial dim {dim}: Will pad from {m} to {t}")
-            else:
-                print(f"  Spatial dim {dim}: No change needed ({t})")
-    else:
-        max_shape = tuple(max_shape)
-
-    print(f"The shape will be: {max_shape}")
-
-    total_files = len(resampled_shapes)
-    elements_per_file = int(np.prod(max_shape))
-    total_size_bytes = elements_per_file * total_files * bytes_per_element
-    total_size_gb = total_size_bytes / (1024**3)
-
-    print(f"Total files to be processed: {total_files}")
-    print(f"One file size after resampling: ({elements_per_file * bytes_per_element / (1024**2):.2f} MB each)")
-    print(f"Estimated total dataset size: {total_size_gb:.2f} GB (data type: {data_type})")
-
-    if not do_conversion:
-        print("Analysis complete. Set `do_conversion=True` to perform the conversion.")
-        return {
-            "max_shape": max_shape,
-            "target_spacing": target_spacing,
-            "target_shape": target_shape,
-            "dtype": data_type,
-            "elements_per_file": elements_per_file,
-            "total_files": total_files,
-            "estimated_total_gb": total_size_gb,
-            "resampled_shapes_per_image": resampled_shapes,
-        }
-
-    # -------- Conversion pass: resample + crop/pad and return arrays --------
-    outputs: List[np.ndarray] = []
-    target_shape_3d = max_shape[-3:]  # (Z, Y, X)
-
-    for img in images:
-        arr = np.asanyarray(img.get_fdata())
-
-        # Reorder to (..., Z, Y, X)
-        if arr.ndim == 3:
-            arr_lyx = np.transpose(arr, (2, 1, 0))
-            leading_shape = ()
-        else:
-            lead_axes = list(range(3, arr.ndim))
-            arr_lyx = np.transpose(arr, lead_axes + [2, 1, 0])
-            leading_shape = arr_lyx.shape[:-3]
-
-        # Spacing as (Z, Y, X)
-        sx, sy, sz = img.header.get_zooms()[:3]
-        spacing_zyx = (sz, sy, sx)
-        current_spacing_3d = get_3d_spacing_from_metadata(list(spacing_zyx), arr_lyx.shape)
-
-        if arr_lyx.ndim == 3:
-            processed = process_3d_volume(
-                arr_lyx, target_spacing, current_spacing_3d, target_shape_3d, data_type
-            )
-            outputs.append(processed)
-        else:
-            out = np.zeros((*leading_shape, *target_shape_3d), dtype=data_type)
-            for idx in itertools.product(*[range(d) for d in leading_shape]):
-                vol3d = arr_lyx[idx]  # (Z, Y, X)
-                proc = process_3d_volume(
-                    vol3d, target_spacing, current_spacing_3d, target_shape_3d, data_type
-                )
-                out[idx] = proc
-            outputs.append(out)
-
-    return outputs
+    return resampled
 
 
 
@@ -2403,7 +2213,6 @@ def predict_from_config(
     images = load_modalities(modality_paths)
 
     # Extract configuration parameters
-    task_type = predict_config["task_type"]
     crop_to_nonzero = predict_config["crop_to_nonzero"]
     norm_op = predict_config["norm_op"]
     num_classes = predict_config["num_classes"]
@@ -2432,14 +2241,22 @@ def predict_from_config(
         transpose_forward=[0, 1, 2],  # Standard transpose order
     )
 
-    x_np = case_preprocessed.squeeze(0).detach().numpy()
+    global_enc_input:list[np.ndarray] = []
+    for img in case_preprocessed:
+        img_npy = img.numpy()
+        img_props = case_properties[img]
 
-
-
-    case_preprocessed = get_multi_crop(x_np)
+        # Process each modality for the global branch
+        processed_img = img_preprocess_for_global_branch(
+            img_npy,
+            img_props,
+            target_spacing=2.6667,
+            target_shape=(96, 96, 96),
+            target_element_type='float16'
+        )
+        global_enc_input.append(processed_img)
 
     # Load the model checkpoint directly with Lightning
-
     model = RegressionHierarchicalFinetuner.load_from_checkpoint(str(model_path))
 
     # Set model to evaluation mode
@@ -2448,14 +2265,23 @@ def predict_from_config(
     # Get device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
+
+    # Convert inputs to tensors and move to device
     case_preprocessed = case_preprocessed.to(device)
+    global_enc_input_tensor = torch.from_numpy(np.stack(global_enc_input, axis=1)).to(device)  # Stack along channel dimension
+
+    # Create batch dictionary as expected by the model
+    batch = {
+        'local': case_preprocessed.unsqueeze(0),  # Add batch dimension: (1, C, D, H, W)
+        'global': global_enc_input_tensor.unsqueeze(0)  # Add batch dimension: (1, C, D, H, W)
+    }
 
     # Run inference
     with torch.no_grad():
-        # Set up sliding window parameters
-
         # Get prediction
-        predictions = model(case_preprocessed)
+        predictions = model(batch)
+        # Remove batch dimension for single sample inference
+        predictions = predictions.squeeze(0)
 
     if reverse_preprocess:
         predictions_original, _ = reverse_preprocessing(
@@ -2497,9 +2323,14 @@ predict_config = {
 }
 
 
+def unnormalize(x: torch.Tensor, target_mean: float, target_std: float) -> torch.Tensor:
+    """Reverses Z-score normalization."""
+    return x * target_std + target_mean
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Run inference on FOMO Task 1 (Infarct Detection)"
+        description="Run inference on FOMO Task 3 (Age regression)"
     )
 
     # Input and output paths using modality names from task config
@@ -2525,7 +2356,7 @@ def main():
         predict_config=predict_config,
     )
 
-    save_output_txt(int(unnormalize(predictions_original, target_mean=61.87, target_std=15.089118845634706).mean()), output_path)
+    save_output_txt(int(unnormalize(predictions_original.cpu(), target_mean=61.87, target_std=15.089118845634706).mean()), output_path)
 
 
 if __name__ == "__main__":

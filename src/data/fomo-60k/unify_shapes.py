@@ -7,7 +7,7 @@ import itertools
 
 def _resample_image_3d(img_data_3d, target_spacing, current_spacing=None):
     """
-    Resample a 3D NIfTI image to a target spacing using SimpleITK.
+    Resample a 3D image to a target spacing using SimpleITK.
 
     Args:
         img_data_3d (np.ndarray): 3D image data array
