@@ -23,7 +23,7 @@ from yucca.modules.data.augmentation.transforms.cropping_and_padding import Crop
 
 import wandb
 import matplotlib.pyplot as plt
-from peft import LoraConfig, get_peft_model, get_peft_model
+from peft import LoraConfig, get_peft_model
 
 from pathlib import Path
 

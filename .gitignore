@@ -1,6 +1,8 @@
 _models
 models/
 models_supervised_transformer/
+*.ckpt
+*.sif
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

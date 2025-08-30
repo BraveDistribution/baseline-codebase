@@ -6,7 +6,7 @@ from batchgenerators.utilities.file_and_folder_operations import (
     join,
     maybe_mkdir_p as ensure_dir_exists,
 )
-from yucca.functional.preprocessing import preprocess_case_for_training_without_label
+from yucca.functional.preprocessing import preprocess_case_for_training_without_label, preprocess_case_for_training_with_label
 from data.task_configs import task1_config
 from utils.utils import parallel_process
 
@@ -75,21 +75,38 @@ def process_subject(task_info):
             if i in modality_mapping
         ]
 
-        # Apply preprocessing
-        preprocessed_images, _ = preprocess_case_for_training_without_label(
-            images=images,
-            normalization_operation=[
-                pp_config["norm_op"] for _ in pp_config["modalities"]
-            ],
-            allow_missing_modalities=False,
-            crop_to_nonzero=pp_config["crop_to_nonzero"],
-            target_orientation=pp_config["target_orientation"],
-            target_spacing=pp_config["target_spacing"],
-        )
+        label_nii_filepath = label_file.replace('label.txt', 'seg.nii.gz')
+        if os.path.isfile(label_nii_filepath):
+            label_image = nib.load(label_nii_filepath)
+            # Apply preprocessing
+            preprocessed_images, preprocessed_label, _ = preprocess_case_for_training_with_label(
+                images=images,
+                label=label_image,
+                normalization_operation=[
+                    pp_config["norm_op"] for _ in pp_config["modalities"]
+                ],
+                allow_missing_modalities=False,
+                crop_to_nonzero=pp_config["crop_to_nonzero"],
+                target_orientation=pp_config["target_orientation"],
+                target_spacing=pp_config["target_spacing"],
+            )
+        else: 
+            preprocessed_images, _ = preprocess_case_for_training_without_label(
+                images=images,
+                normalization_operation=[
+                    pp_config["norm_op"] for _ in pp_config["modalities"]
+                ],
+                allow_missing_modalities=False,
+                crop_to_nonzero=pp_config["crop_to_nonzero"],
+                target_orientation=pp_config["target_orientation"],
+                target_spacing=pp_config["target_spacing"],
+            )
 
         # Save preprocessed data
         save_path = join(target_preprocessed, f"{prefix}_{subject_id}")
         np.save(save_path + ".npy", preprocessed_images)
+        if os.path.isfile(label_nii_filepath):
+            np.save(save_path + "_label.npy", preprocessed_label)
         shutil.copy(label_file, join(target_preprocessed, f"{prefix}_{subject_id}.txt"))
 
         return f"Processed {folder_name}"
