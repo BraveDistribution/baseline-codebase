@@ -48,6 +48,8 @@ from monai.transforms import (
     RandHistogramShiftd,      # nonlinear intensity warp
 )
 
+from monai.transforms import MeanEnsemble, Activations, AsDiscrete
+
 def generate_random_mask(
     x: torch.Tensor,
     mask_ratio: float,
@@ -712,17 +714,12 @@ def predict_from_config(
             mode="gaussian",
         )
 
-        prob_sum = None
+        logits_list = []
         for m in models:
-            logits = inferer(inputs=case_preprocessed, network=m)       # (1, num_classes, D, H, W)
-            probs  = torch.softmax(logits, dim=1)                       # (1, num_classes, D, H, W)
-            prob_sum = probs if prob_sum is None else (prob_sum + probs)
-            # (optional) free temps
-            del logits, probs
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        predictions = prob_sum / len(models)
-
+            l = inferer(inputs=case_preprocessed, network=m)   # (B,C,D,H,W)
+            logits_list.append(l)
+        logits_ens = MeanEnsemble()(logits_list)               # elementwise mean of logits
+        predictions = Activations(softmax=True)(logits_ens)    # (B,C,...) probs
 
     if reverse_preprocess:
         predictions_original, _ = reverse_preprocessing(
@@ -813,9 +810,9 @@ def main():
         reverse_preprocess=True,
     )
 
-    prediction_final = np.argmax(predictions[0], axis=0).astype(np.int32)
+    pred_labels = AsDiscrete(argmax=True)(predictions)
 
-    save_segmentation(prediction_final, affine, output_path)
+    save_segmentation(pred_labels, affine, output_path)
 
 
 if __name__ == "__main__":
