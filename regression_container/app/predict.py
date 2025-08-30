@@ -1250,9 +1250,6 @@ def predict_from_config(
 
     crops  = get_multi_crop(x_np)
 
-    # Load the model checkpoint directly with Lightning
-
-    model = RegressionFinetuner4.load_from_checkpoint(str(model_path))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     crops = crops.to(device)
