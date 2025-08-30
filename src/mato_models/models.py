@@ -3,6 +3,7 @@ import os
 import wandb
 from monai.losses import DiceCELoss
 from monai.metrics import DiceMetric
+from monai.losses.hausdorff_loss import HausdorffDTLoss
 
 import pytorch_lightning as pl
 import torch
@@ -16,7 +17,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from torchmetrics import AUROC
 from torchmetrics.classification import BinaryAccuracy
 from torchmetrics.regression import PearsonCorrCoef
-
+from torch.optim.lr_scheduler import CosineAnnealingLR
 import matplotlib.pyplot as plt
 
 
@@ -286,6 +287,178 @@ class ContrastiveTransformer(pl.LightningModule):
             }
         }
 
+class SegmentationFineTuner(pl.LightningModule):
+    """
+    Final, robust version with automated weight-loading fix.
+    """
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        img_size: Tuple[int, int, int],
+        feature_size: int, # This must match the pre-trained model
+        encoder_lr: float = 1e-5,
+        decoder_lr: float = 2e-4,
+        min_lr: float = 1e-6,
+        weight_decay: float = 1e-5,
+        boundary_loss_lambda: float = 1.0,
+        lora_r: int = 16,
+        lora_alpha: int = 32,
+        sw_batch_size: int = 4,
+        sw_overlap: float = 0.75,
+        use_tta: bool = True,
+        post_process_largest_cc: bool = True,
+        **kwargs,
+    ):
+        super().__init__()
+        self.save_hyperparameters()
+
+        self.model = SwinUNETR(
+            in_channels=self.hparams.in_channels,
+            out_channels=self.hparams.out_channels,
+            feature_size=self.hparams.feature_size,
+            use_v2=True,
+        )
+        self._apply_lora()
+        for name, param in self.model.named_parameters():
+            if name.startswith("decoder") or name.startswith("out"):
+                param.requires_grad = True
+        
+        print("--- Model Trainable Parameters Initialized ---")
+        for name, param in self.model.named_parameters():
+            if param.requires_grad: print(f"  - Trainable: {name}")
+
+        self.dice_ce_loss = DiceCELoss(to_onehot_y=True, softmax=True)
+        self.boundary_loss = HausdorffDTLoss(to_onehot_y=True, softmax=True)
+        self.dice_metric = DiceMetric(include_background=False, reduction="mean")
+        self.sliding_window_inferer = SlidingWindowInferer(
+            roi_size=self.hparams.img_size,
+            sw_batch_size=self.hparams.sw_batch_size,
+            overlap=self.hparams.sw_overlap,
+            mode="gaussian",
+        )
+        if self.hparams.post_process_largest_cc:
+            self.keep_largest_cc = KeepLargestConnectedComponent(
+                applied_labels=list(range(1, self.hparams.out_channels))
+            )
+
+    @classmethod
+    def load_from_pretrained(
+        cls,
+        pretrained_checkpoint_path: str,
+        out_channels: int,
+        in_channels: int,
+        feature_size: int, # Pass the correct feature_size here
+        **kwargs
+    ):
+        print(f"Loading pre-trained model from: {pretrained_checkpoint_path}")
+        pretrain_model = ContrastiveTransformer.load_from_checkpoint(pretrained_checkpoint_path)
+        finetuner_hparams = {**pretrain_model.hparams, **kwargs}
+        
+        # Override critical parameters with user-provided values
+        finetuner_hparams['out_channels'] = out_channels
+        finetuner_hparams['in_channels'] = in_channels
+        finetuner_hparams['feature_size'] = feature_size
+        if 'num_classes' in finetuner_hparams: finetuner_hparams.pop('num_classes')
+
+        print(f"--- Initializing fine-tuning model with feature_size={feature_size}, in_channels={in_channels}, out_channels={out_channels} ---")
+        model = cls(**finetuner_hparams)
+        
+        if hasattr(pretrain_model, 'encoder'): src_dict = pretrain_model.encoder.state_dict()
+        elif hasattr(pretrain_model, 'model'): src_dict = pretrain_model.model.state_dict()
+        else: src_dict = pretrain_model.state_dict()
+
+        # --- PROGRAMMATIC FIX FOR WEIGHT MISMATCH ---
+        output_keys_to_remove = [k for k in src_dict if k.startswith('out.')]
+        if output_keys_to_remove:
+            print(f"Ignoring {len(output_keys_to_remove)} keys from the pre-trained output layer.")
+            for k in output_keys_to_remove:
+                del src_dict[k]
+
+        input_layer_keys = [k for k in src_dict if k.startswith('encoder1.layer.') and 'conv.weight' in k]
+        target_in_channels = model.hparams.in_channels
+        
+        for key in input_layer_keys:
+            source_weight = src_dict.get(key)
+            if source_weight is None: continue
+            
+            if source_weight.shape[1] != target_in_channels:
+                print(f"Fixing input layer '{key}':")
+                inflated_weight = source_weight.repeat(1, target_in_channels, 1, 1, 1) / target_in_channels
+                src_dict[key] = inflated_weight
+                print(f"  - New weight shape: {src_dict[key].shape}")
+
+        msg = model.model.load_state_dict(src_dict, strict=False)
+        print(f"✓ Pre-trained weights loaded successfully and adapted.")
+        print(f"  - Missing keys (expected): {msg.missing_keys}")
+        print(f"  - Unexpected keys (should now be empty): {msg.unexpected_keys}")
+
+        return model
+
+    def _apply_lora(self):
+        lora_config = LoraConfig(
+            r=self.hparams.lora_r, lora_alpha=self.hparams.lora_alpha,
+            target_modules=["qkv"], lora_dropout=0.1, bias="none",
+        )
+        self.model.swinViT = get_peft_model(self.model.swinViT, lora_config)
+
+    def forward(self, x_in: torch.Tensor) -> List[torch.Tensor]: return self.model(x_in)
+
+    def _calculate_deep_supervision_loss(self, outputs: List[torch.Tensor], labels: torch.Tensor) -> torch.Tensor:
+        total_loss = 0
+        weights = np.array([1 / (2 ** i) for i in range(len(outputs))])
+        weights = weights / np.sum(weights)
+        for i, pred in enumerate(outputs):
+            label_downsampled = nn.functional.interpolate(labels.float(), size=pred.shape[2:], mode='nearest')
+            loss_dice_ce = self.dice_ce_loss(pred, label_downsampled)
+            loss_boundary = self.boundary_loss(pred, label_downsampled)
+            total_loss += (loss_dice_ce + self.hparams.boundary_loss_lambda * loss_boundary) * weights[i]
+        return total_loss
+
+    def training_step(self, batch, batch_idx):
+        images, labels = batch['image'], batch['label']
+        outputs = self.forward(images)
+        loss = self._calculate_deep_supervision_loss(outputs, labels)
+        self.log('train/total_loss', loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        images, labels = batch['image'], batch['label']
+        outputs = self.sliding_window_inferer(inputs=images, network=lambda x: self.forward(x)[0])
+        self.log('val/loss', self.dice_ce_loss(outputs, labels), on_epoch=True, sync_dist=True)
+        post_label = AsDiscrete(to_onehot=self.hparams.out_channels)(labels)
+        post_pred = AsDiscrete(argmax=True, to_onehot=self.hparams.out_channels)(outputs)
+        if self.hparams.post_process_largest_cc: post_pred = self.keep_largest_cc(post_pred)
+        self.dice_metric(y_pred=post_pred, y=post_label)
+
+    def on_validation_epoch_end(self):
+        if self.trainer.sanity_checking: return
+        val_dice = self.dice_metric.aggregate().item()
+        self.log('val/dice', val_dice, prog_bar=True, sync_dist=True)
+        self.dice_metric.reset()
+
+    def predict_step(self, batch, batch_idx, dataloader_idx=0):
+        images = batch['image']
+        inferer_fn = lambda x: self.forward(x)[0]
+        if self.hparams.use_tta:
+            tta_flips = [[], [2], [3], [4]]
+            all_pred_probs = [torch.flip(self.sliding_window_inferer(torch.flip(images, dims=f), inferer_fn), dims=f).softmax(dim=1) for f in tta_flips]
+            final_probs = torch.stack(all_pred_probs).mean(dim=0)
+        else:
+            final_probs = self.sliding_window_inferer(images, inferer_fn).softmax(dim=1)
+        final_labels = torch.argmax(final_probs, dim=1, keepdim=True)
+        if self.hparams.post_process_largest_cc: final_labels = self.keep_largest_cc(final_labels)
+        return final_labels
+
+    def configure_optimizers(self):
+        params = [{'params': [], 'lr': self.hparams.encoder_lr}, {'params': [], 'lr': self.hparams.decoder_lr}]
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad: continue
+            params[0 if 'swinViT' in name else 1]['params'].append(param)
+        optimizer = torch.optim.AdamW(params, weight_decay=self.hparams.weight_decay)
+        scheduler = CosineAnnealingLR(optimizer, T_max=self.trainer.max_epochs, eta_min=self.hparams.min_lr)
+        return {'optimizer': optimizer, 'lr_scheduler': {'scheduler': scheduler, 'interval': 'epoch'}}
+
 class ClassificationFineTuner(pl.LightningModule):
     def __init__(
         self,
@@ -516,21 +689,21 @@ class ClassificationFineTuner(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-            images, labels = batch['image'], batch['label'].long()
+        images, labels = batch['image'], batch['label'].long()
 
-            logits = self(images).squeeze()
-            loss = F.binary_cross_entropy_with_logits(logits, labels.float())
+        logits = self(images).squeeze()
+        loss = F.binary_cross_entropy_with_logits(logits, labels.float())
 
-            # Update metrics
-            probs = torch.sigmoid(logits)
-            self.val_acc.update(probs, labels)
-            self.val_auroc.update(probs, labels)
+        # Update metrics
+        probs = torch.sigmoid(logits)
+        self.val_acc.update(probs, labels)
+        self.val_auroc.update(probs, labels)
 
-            self.log_dict({
-                'val/loss': loss,
-                'val/acc': self.val_acc,
-                'val/auroc': self.val_auroc,
-            }, prog_bar=True, on_epoch=True)
+        self.log_dict({
+            'val/loss': loss,
+            'val/acc': self.val_acc,
+            'val/auroc': self.val_auroc,
+        }, prog_bar=True, on_epoch=True)
 
     def test_step(self, batch, batch_idx):
         images = batch['image']
@@ -1016,190 +1189,27 @@ from peft import get_peft_model, LoraConfig
 # Assuming the ContrastiveTransformer class from your pre-training is available
 # from pretrain_module import ContrastiveTransformer
 
+# ==============================================================================
+# Final, Corrected PyTorch Lightning Module
+# Author: MICCAI-Prodigy
+# FIX: Programmatically handles input/output channel mismatch during weight loading.
+# ==============================================================================
 
-class SegmentationFineTuner(pl.LightningModule):
-    """
-    Fine-tunes a pre-trained SwinUNETR using a shared-weight fusion
-    architecture, now upgraded with LoRA for parameter-efficient tuning.
-    """
-    def __init__(
-        self,
-        num_classes: int,
-        in_channels: int, # Number of modalities
-        img_size: Tuple[int, int, int] = (96, 96, 96),
-        feature_size: int = 24,
-        learning_rate: float = 1e-5,
-        use_lora: bool = True, # Use LoRA instead of simple freezing
-        lora_r: int = 8,
-        lora_alpha: int = 16,
-        warmup_epochs: int = 5,
-        max_epochs: int = 100,
-        min_lr: float = 1e-6,
-        sw_batch_size: int = 4,
-        sw_overlap: float = 0.5,
-        log_image_frequency: int = 5,
-        **kwargs,
-    ):
-        super().__init__()
-        self.save_hyperparameters()
+import torch
+import torch.nn as nn
+import pytorch_lightning as pl
+from typing import Tuple, List
+import numpy as np
 
-        # We only need one SwinUNETR model, which will be shared across modalities
-        self.encoder = SwinUNETR(
-            in_channels=1, # The shared encoder sees one modality at a time
-            out_channels=self.hparams.num_classes,
-            feature_size=self.hparams.feature_size,
-            use_checkpoint=False, # Checkpointing can interfere with PEFT
-            use_v2=True,
-        )
+# --- MONAI Imports ---
+from monai.networks.nets import SwinUNETR
+from monai.losses import DiceCELoss, HausdorffDTLoss
+from monai.metrics import DiceMetric
+from monai.inferers import SlidingWindowInferer
+from monai.transforms import AsDiscrete, KeepLargestConnectedComponent
 
-        # --- LoRA Integration ---
-        if self.hparams.use_lora:
-            print("--- Applying LoRA to SwinViT backbone ---")
-            lora_config = LoraConfig(
-                r=self.hparams.lora_r,
-                lora_alpha=self.hparams.lora_alpha,
-                target_modules=["qkv"], # Apply to query, key, value projections in attention
-                lora_dropout=0.1,
-                bias="none",
-            )
-            # Wrap the SwinViT part of the encoder. The rest of the model (CNN blocks,
-            # decoder) is untouched and its trainability is determined by requires_grad.
-            self.encoder.swinViT = get_peft_model(self.encoder.swinViT, lora_config)
-            print("Trainable parameters with LoRA enabled:")
-            self.encoder.swinViT.print_trainable_parameters()
-            # By default, peft freezes the non-LoRA parts of the wrapped module.
-            # We only need to ensure the decoder is trainable.
-            for param in self.encoder.decoder1.parameters(): param.requires_grad = True
-            for param in self.encoder.decoder2.parameters(): param.requires_grad = True
-            for param in self.encoder.decoder3.parameters(): param.requires_grad = True
-            for param in self.encoder.decoder4.parameters(): param.requires_grad = True
-            for param in self.encoder.decoder5.parameters(): param.requires_grad = True
-            for param in self.encoder.out.parameters(): param.requires_grad = True
-
-
-        self.loss_function = DiceLoss(to_onehot_y=True, softmax=True)
-        self.dice_metric = DiceMetric(include_background=False, reduction="mean", get_not_nans=False)
-        self.sliding_window_inferer = SlidingWindowInferer(
-            roi_size=self.hparams.img_size, sw_batch_size=self.hparams.sw_batch_size,
-            overlap=self.hparams.sw_overlap, mode="gaussian",
-        )
-
-    @classmethod
-    def load_from_pretrained(
-        cls,
-        pretrained_checkpoint_path: str,
-        num_classes: int,
-        in_channels: int,
-        **kwargs
-    ):
-        # NOTE: This assumes ContrastiveTransformer class is defined and accessible
-        pretrain_model = ContrastiveTransformer.load_from_checkpoint(pretrained_checkpoint_path)
-        finetuner_hparams = {**pretrain_model.hparams, **kwargs}
-        finetuner_hparams['num_classes'] = num_classes
-        finetuner_hparams['in_channels'] = in_channels
-
-        model = cls(**finetuner_hparams)
-        print(f"\nShared-weight fusion model instantiated for {in_channels} modalities.")
-
-        # Load weights, ignoring the final output layer of the pre-trained model
-        src_dict = pretrain_model.encoder.state_dict()
-        src_dict.pop('out.conv.conv.weight', None)
-        src_dict.pop('out.conv.conv.bias', None)
-
-        # Load into the main encoder. LoRA will be applied on top of these weights.
-        msg = model.encoder.load_state_dict(src_dict, strict=False)
-        print(f"✓ Pre-trained encoder loaded successfully.")
-        print(f"  Missing keys: {len(msg.missing_keys)}")   # Should be the decoder keys
-        print(f"  Unexpected keys: {len(msg.unexpected_keys)}") # Should be 0
-
-        return model
-
-    def forward(self, x):
-        B, C, D, H, W = x.shape
-        x_reshaped = x.view(B * C, 1, D, H, W)
-        logits_reshaped = self.encoder(x_reshaped)
-        _, Num_Classes, D_out, H_out, W_out = logits_reshaped.shape
-        logits_per_modality = logits_reshaped.view(B, C, Num_Classes, D_out, H_out, W_out)
-        fused_logits = logits_per_modality.mean(dim=1)
-        return fused_logits
-
-    def configure_optimizers(self):
-        # Pytorch Lightning will automatically find the trainable parameters.
-        # With PEFT, this will be the LoRA weights and the decoder weights.
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.learning_rate, weight_decay=0.01)
-
-        def lr_lambda(current_step: int):
-            num_training_steps = self.trainer.estimated_stepping_batches
-            num_warmup_steps = int(num_training_steps * self.hparams.warmup_epochs / self.hparams.max_epochs)
-            if current_step < num_warmup_steps: return float(current_step) / float(max(1, num_warmup_steps))
-            progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
-            cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
-            min_lr_ratio = self.hparams.min_lr / self.hparams.learning_rate
-            return (1 - min_lr_ratio) * cosine_decay + min_lr_ratio
-        
-        scheduler = LambdaLR(optimizer, lr_lambda)
-        return {'optimizer': optimizer, 'lr_scheduler': {'scheduler': scheduler, 'interval': 'step'}}
-
-    def training_step(self, batch, batch_idx):
-        images, labels = batch['image'], batch['label']
-        outputs = self(images)
-        loss = self.loss_function(outputs, labels)
-        self.log('train/loss', loss, on_step=True, on_epoch=True, prog_bar=True)
-        return loss
-
-    def validation_step(self, batch, batch_idx):
-        images, labels = batch['image'], batch['label']
-        outputs = self.sliding_window_inferer(inputs=images, network=self)
-        loss = self.loss_function(outputs, labels)
-        post_pred = torch.argmax(outputs, dim=1, keepdim=True)
-        self.dice_metric(y_pred=post_pred, y=labels)
-        self.log('val/loss', loss, on_epoch=True)
-        if self.current_epoch % self.hparams.log_image_frequency == 0:
-            self._log_validation_images(batch, outputs, batch_idx)
-        return loss
-
-    def on_validation_epoch_end(self):
-        if self.trainer.sanity_checking: return
-        val_dice = self.dice_metric.aggregate().item()
-        self.log('val/dice', val_dice, prog_bar=True)
-        self.dice_metric.reset()
-    def _log_validation_images(self, batch, outputs, batch_idx):
-        if batch_idx > 0 or not hasattr(self, 'trainer') or self.trainer.global_rank != 0: return
-        if not self.logger or not self.logger.experiment: return
-        
-        # --- Start of corrected block ---
-        
-        try:
-            img, label = batch['image'][0].cpu().numpy(), batch['label'][0].squeeze().cpu().numpy()
-            pred = torch.argmax(outputs[0], dim=0).cpu().numpy()
-            vis_img = img[0] if img.ndim > 3 else img
-
-            # Correctly find the slice with the largest area for the label
-            # Sum over the other two axes to get a 1D array for each dimension
-            slice_idx_z = np.argmax(np.sum(label, axis=(1, 2))) # Axial slice
-            slice_idx_y = np.argmax(np.sum(label, axis=(0, 2))) # Coronal slice
-            slice_idx_x = np.argmax(np.sum(label, axis=(0, 1))) # Sagittal slice
-            
-            fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-            fig.suptitle(f"Epoch {self.current_epoch} - Sample 0", fontsize=16)
-            
-            views = [
-                ("Axial", vis_img[slice_idx_z, :, :], label[slice_idx_z, :, :], pred[slice_idx_z, :, :]),
-                ("Coronal", vis_img[:, slice_idx_y, :], label[:, slice_idx_y, :], pred[:, slice_idx_y, :]),
-                ("Sagittal", vis_img[:, :, slice_idx_x], label[:, :, slice_idx_x], pred[:, :, slice_idx_x]),
-            ]
-
-            for i, (title, img_slice, lbl_slice, pred_slice) in enumerate(views):
-                axes[i].imshow(np.rot90(img_slice), cmap="gray")
-                if np.any(lbl_slice): axes[i].contour(np.rot90(lbl_slice), colors='yellow', linewidths=0.8, alpha=0.9)
-                if np.any(pred_slice): axes[i].contour(np.rot90(pred_slice), colors='red', linewidths=0.8, alpha=0.9)
-                axes[i].set_title(title); axes[i].axis('off')
-            
-            self.logger.experiment.log({"Validation/Prediction vs Label": wandb.Image(fig)})
-            plt.close(fig)
-        
-        except Exception as e:
-            print(f"Error during validation image logging: {e}")
+# --- PEFT/LoRA Imports ---
+from peft import get_peft_model, LoraConfig
 
 
 import torch.nn.functional as F
@@ -1312,13 +1322,9 @@ class ClassificationFinetuner2(pl.LightningModule):
             p.requires_grad = False
         self.encoder.eval()
     def training_step(self, batch, batch_idx):
-        # This part remains the same
-        images, labels = batch['image'], batch['label'].float()
+        images, labels, label_seg = batch['image'], batch['reg_label'].float(), batch["label"]
         logits = self(images)
         labels = labels.view(-1).float().to(logits.device)
-        # print("logits:", logits.shape, "labels:", labels.shape)
-
-        # print("logits:", logits)
         loss = F.binary_cross_entropy_with_logits(logits, labels)
         self.log('train_loss', loss, prog_bar=True)
         return loss
@@ -1329,8 +1335,7 @@ class ClassificationFinetuner2(pl.LightningModule):
         self.log("dbg/cls_head_has_grads", float(all(g)), prog_bar=True)
 
     def validation_step(self, batch, batch_idx):
-        images, labels = batch['image'], batch['label'].float()
-
+        images, labels, label_seg = batch['image'], batch['reg_label'].float(), batch["label"]
         logits = self(images)
         labels = labels.view(-1).float().to(logits.device)
         loss = F.binary_cross_entropy_with_logits(logits, labels.float())
@@ -2897,6 +2902,693 @@ class RegressionFinetuner4(pl.LightningModule):
     def apply_bias_correction(self, yhat: torch.Tensor) -> torch.Tensor:
         return self.bias_a * yhat + self.bias_b
     
+    
+class ClassificationFinetuner3(pl.LightningModule):
+    def __init__(
+        self,
+        in_channels: int,
+        feature_size: int = 24,
+        img_size: Tuple[int, int, int] = (96, 96, 96),
+        learning_rate: float = 1e-4,
+        weight_decay: float = 0.01,
+        **kwargs,
+    ):
+        super().__init__()
+        self.save_hyperparameters()
+
+        # Frozen encoder
+        self.encoder = SwinUNETR(
+            in_channels=1,
+            out_channels=2,
+            feature_size=feature_size,
+            use_v2=True,
+        )
+        self.dice_ce_loss = DiceCELoss(to_onehot_y=True, softmax=True)
+
+        # Determine dimensions for each layer output
+        with torch.no_grad():
+            dummy = torch.zeros(1, 1, *img_size)
+            all_features = self.encoder.swinViT(dummy)
+            # Typically: [48, 96, 192, 384, 768] channels for different layers
+            feature_dims = [f.shape[1] for f in all_features]
+
+        # Separate pooling for each scale
+        self.pools = nn.ModuleList([
+            nn.AdaptiveAvgPool3d(1) for _ in range(5)
+        ])
+
+        # Projection to common dimension for each scale
+        common_dim = 64
+
+        self.projections = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(dim, common_dim),
+                nn.LayerNorm(common_dim),  # Works with ANY batch size
+                nn.ReLU()
+            ) for dim in feature_dims
+        ])
+
+        self.classifier_head = nn.Sequential(
+            nn.Linear(in_channels * 5 * common_dim, 128),
+            nn.LayerNorm(128),  # Instead of BatchNorm1d
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, 1)
+        )
+
+        self._freeze_encoder()
+
+        # Metrics
+        self.val_acc = BinaryAccuracy()
+        self.val_auroc = AUROC(task="binary")
+
+    def forward(self, x):
+        B, C = x.shape[0], x.shape[1]
+        x_reshaped = x.view(B * C, 1, *x.shape[2:])
+
+        all_features = self.encoder.swinViT(x_reshaped)
+
+        enc0 = self.encoder1(x[:, 0, :, :, :])
+        enc1 = self.encoder2(all_features[0])
+        enc2 = self.encoder3(all_features[1])
+        enc3 = self.encoder4(all_features[2])
+        dec4 = self.encoder10(all_features[4])
+        dec3 = self.decoder5(dec4, all_features[3])
+        dec2 = self.decoder4(dec3, enc3)
+        dec1 = self.decoder3(dec2, enc2)
+        dec0 = self.decoder2(dec1, enc1)
+        seg = self.decoder1(dec0, enc0)
+
+        pooled_features = []
+        for i, features in enumerate(all_features):
+            pooled = self.pools[i](features)  # [B*C, dim, 1, 1, 1]
+            pooled = pooled.view(B * C, -1)   # [B*C, dim]
+            projected = self.projections[i](pooled)  # [B*C, 64]
+            pooled_features.append(projected)
+        multi_scale = torch.cat(pooled_features, dim=1)  # [B*C, 5*64]
+        multi_scale = multi_scale.view(B, C * 5 * 64)    # [B, C*5*64]
+        logits = self.classifier_head(multi_scale)
+        return logits.squeeze(-1), seg
+
+    def _freeze_encoder(self):
+        for p in self.encoder.swinViT.parameters():
+            p.requires_grad = False
+        self.encoder.eval()
+
+    def training_step(self, batch, batch_idx):
+        images, labels, label_seg = batch['image'], batch['reg_label'].float(), batch["label"]
+        logits, segs = self(images)
+        labels = labels.view(-1).float().to(logits.device)
+        loss = F.binary_cross_entropy_with_logits(logits, labels)
+        self.log('train_loss', loss, prog_bar=True)
+        return loss
+
+    def on_after_backward(self):
+        # grads exist now
+        g = [p.grad is not None and torch.isfinite(p.grad).all() for p in self.classifier_head.parameters()]
+        self.log("dbg/cls_head_has_grads", float(all(g)), prog_bar=True)
+
+    def validation_step(self, batch, batch_idx):
+        images, labels, label_seg = batch['image'], batch['reg_label'].float(), batch["label"]
+        logits, segs = self(images)
+        labels = labels.view(-1).float().to(logits.device)
+        loss = F.binary_cross_entropy_with_logits(logits, labels.float())
+        probs = torch.sigmoid(logits)
+        self.val_acc.update(probs, labels)
+        self.val_auroc.update(probs, labels)
+        self.log_dict({'val/loss': loss, 'val_acc': self.val_acc, 'val_auroc': self.val_auroc}, on_epoch=True, prog_bar=True)
+
+
+    def configure_optimizers(self):
+        trainable_params = list(self.projections.parameters()) + \
+                        list(self.classifier_head.parameters())
+
+        optimizer = torch.optim.AdamW(
+            trainable_params,
+            lr=self.hparams.learning_rate,
+            weight_decay=self.hparams.weight_decay
+        )
+
+        # Restarts every 50 epochs, with increasing periods
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=50,  # First restart after 50 epochs
+            T_mult=2,  # Double the period after each restart (50, 100, 150)
+            eta_min=1e-7
+        )
+
+        return {
+            'optimizer': optimizer,
+            'lr_scheduler': {
+                'scheduler': scheduler,
+                'interval': 'epoch',
+                'frequency': 1
+            }
+        }
+
+
+    @classmethod
+    def load_from_pretrained(
+        cls,
+        checkpoint_path: str,
+        num_classes: int,
+        in_channels: int,
+        **kwargs
+    ):
+        """
+        Loads only the SwinViT backbone weights from a ContrastiveTransformer checkpoint.
+        """
+        if not num_classes:
+            raise ValueError("num_classes must be specified for fine-tuning.")
+
+        # Load pretrained ContrastiveTransformer
+        pretrain_model = ContrastiveTransformer.load_from_checkpoint(checkpoint_path)
+
+        finetuner_hparams = pretrain_model.hparams
+        finetuner_hparams.update(kwargs)
+        finetuner_hparams['num_classes'] = num_classes
+        finetuner_hparams['in_channels'] = in_channels
+
+        # Create finetuner with fresh weights
+        model = cls(**finetuner_hparams)
+
+        # --- Extract just swinViT weights ---
+        src_dict = pretrain_model.encoder.swinViT.state_dict()
+        dst_dict = model.encoder.swinViT.state_dict()
+
+        # Keep only matching keys with identical shape
+        filtered = {k: v for k, v in src_dict.items() if k in dst_dict and v.shape == dst_dict[k].shape}
+
+        # Load into finetuner backbone
+        msg = model.encoder.swinViT.load_state_dict(filtered, strict=False)
+
+        print(f"\n✓ Loaded {len(filtered)} swinViT tensors from {checkpoint_path}")
+        print(f"   Missing keys: {len(msg.missing_keys)} | Unexpected keys: {len(msg.unexpected_keys)}\n")
+
+        return model
+
+class SimpleFPN_Decoder(nn.Module):
+    """
+    A lightweight Feature Pyramid Network (FPN) style decoder.
+    It upsamples and fuses features from different scales of the encoder.
+    """
+    def __init__(self, feature_dims: List[int], img_size: Tuple[int, int, int], common_dim: int = 64):
+        super().__init__()
+        self.img_size = img_size
+        
+        # 1. Project encoder features to a common dimension
+        self.projections = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv3d(dim, common_dim, kernel_size=1),
+                # Use GroupNorm as batch size is very small in fine-tuning
+                nn.GroupNorm(8, common_dim), 
+                nn.ReLU(inplace=True)
+            )
+             for dim in feature_dims
+        ])
+
+        # 2. Fusion and final output layers
+        self.fusion_conv = nn.Sequential(
+            nn.Conv3d(common_dim * len(feature_dims), common_dim*2, kernel_size=3, padding=1),
+            nn.GroupNorm(8, common_dim*2),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(common_dim*2, common_dim, kernel_size=3, padding=1),
+            nn.GroupNorm(8, common_dim),
+            nn.ReLU(inplace=True),
+        )
+        # Output channel is 1 for binary segmentation logits
+        self.output_conv = nn.Conv3d(common_dim, 1, kernel_size=1)
+
+    def forward(self, features: List[torch.Tensor]):
+        upsampled_features = []
+
+        for i, feature in enumerate(features):
+            # Project
+            projected = self.projections[i](feature)
+            # Upsample to the target image resolution
+            upsampled = F.interpolate(
+                projected,
+                size=self.img_size,
+                mode='trilinear',
+                align_corners=False
+            )
+            upsampled_features.append(upsampled)
+
+        # Fuse (Concatenate)
+        concatenated = torch.cat(upsampled_features, dim=1)
+
+        # Process fused features and output logits
+        fused = self.fusion_conv(concatenated)
+        logits = self.output_conv(fused)
+        return logits
+
+# -----------------------------------------------------------------
+# Main Module: Classification Finetuner with Multi-Task Learning
+# -----------------------------------------------------------------
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import pytorch_lightning as pl
+from typing import Tuple, List
+from torchmetrics.classification import BinaryAccuracy, AUROC
+
+# Assuming these imports are available
+from monai.networks.nets import SwinUNETR
+from monai.losses import DiceCELoss
+# Note: ContrastiveTransformer must be defined in the scope for load_from_pretrained to work
+# from your_project import ContrastiveTransformer 
+
+# -----------------------------------------------------------------
+# 1. Updated FPN Decoder
+# -----------------------------------------------------------------
+
+class SimpleFPN_Decoder(nn.Module):
+    """
+    A lightweight FPN decoder that returns both segmentation logits and high-level features.
+    """
+    def __init__(self, feature_dims: List[int], img_size: Tuple[int, int, int], common_dim: int = 64):
+        super().__init__()
+        self.img_size = img_size
+        
+        # Projections
+        self.projections = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv3d(dim, common_dim, kernel_size=1),
+                # Use GroupNorm as batch size is very small
+                nn.GroupNorm(8, common_dim), 
+                nn.ReLU(inplace=True)
+            )
+             for dim in feature_dims
+        ])
+
+        # Fusion layers
+        self.fusion_conv = nn.Sequential(
+            nn.Conv3d(common_dim * len(feature_dims), common_dim*2, kernel_size=3, padding=1),
+            nn.GroupNorm(8, common_dim*2),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(common_dim*2, common_dim, kernel_size=3, padding=1),
+            nn.GroupNorm(8, common_dim),
+            nn.ReLU(inplace=True),
+        )
+        # Output channel is 1 for binary segmentation logits
+        self.output_conv = nn.Conv3d(common_dim, 1, kernel_size=1)
+
+    def forward(self, features: List[torch.Tensor]):
+        upsampled_features = []
+
+        for i, feature in enumerate(features):
+            projected = self.projections[i](feature)
+            upsampled = F.interpolate(
+                projected,
+                size=self.img_size,
+                mode='trilinear',
+                align_corners=False
+            )
+            upsampled_features.append(upsampled)
+
+        concatenated = torch.cat(upsampled_features, dim=1)
+
+        # [CHANGE] Capture features before the final convolution
+        fused_features = self.fusion_conv(concatenated)
+        logits = self.output_conv(fused_features)
+        
+        # [CHANGE] Return both logits and the features for late fusion
+        return logits, fused_features
+
+
+class ClassificationFinetunerMTL(pl.LightningModule):
+    def __init__(
+        self,
+        in_channels: int,
+        feature_size: int = 24,
+        img_size: Tuple[int, int, int] = (96, 96, 96),
+        learning_rate: float = 1e-4,
+        weight_decay: float = 0.01,
+        lambda_seg: float = 0.5, # Weight for the segmentation loss (Hyperparameter)
+        **kwargs,
+    ):
+        super().__init__()
+        self.save_hyperparameters()
+        self.img_size = self.hparams.img_size if 'img_size' in self.hparams else img_size
+
+        # --- Frozen Encoder (Same as original) ---
+        self.encoder = SwinUNETR(
+            in_channels=1,
+            out_channels=1,
+            feature_size=feature_size,
+            use_v2=True,
+        )
+
+        # Determine feature dimensions
+        with torch.no_grad():
+            dummy = torch.zeros(1, 1, *self.img_size)
+            self.encoder.eval()
+            all_features = self.encoder.swinViT(dummy)
+            feature_dims = [f.shape[1] for f in all_features]
+
+        # --- Classification Path Projections (Same as original) ---
+        self.pools = nn.ModuleList([
+            nn.AdaptiveAvgPool3d(1) for _ in range(5)
+        ])
+
+        self.common_dim_cls = 64 # Dimension for classification features
+        self.cls_projections = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(dim, self.common_dim_cls),
+                nn.LayerNorm(self.common_dim_cls),
+                nn.ReLU()
+            ) for dim in feature_dims
+        ])
+        
+        # --- Segmentation Decoder ---
+        # NOTE: Assumes SimpleFPN_Decoder is defined and imported/available, returning (logits, features)
+        self.common_dim_seg = 32 # Dimension for the segmentation features (auxiliary task)
+        self.segmentation_decoder = SimpleFPN_Decoder(
+            feature_dims=feature_dims, 
+            img_size=self.img_size, 
+            common_dim=self.common_dim_seg
+        )
+        
+        # Pooling layer for the segmentation features (for fusion)
+        self.seg_pool = nn.AdaptiveAvgPool3d(1)
+
+        # --- Classifier Head (UPDATED for Fusion) ---
+        # Input = (C * 5 scales * ClsDim) + SegDim
+        cls_input_dim = (in_channels * 5 * self.common_dim_cls) + self.common_dim_seg
+        
+        self.classifier_head = nn.Sequential(
+            nn.Linear(cls_input_dim, 128),
+            nn.LayerNorm(128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, 1)
+        )
+
+        self._freeze_encoder()
+
+        # --- Losses and Metrics ---
+        # Segmentation loss: Dice + CrossEntropy
+        self.seg_loss_fn = DiceCELoss(sigmoid=True, lambda_dice=0.5, lambda_ce=0.5)
+        self.val_acc = BinaryAccuracy()
+        self.val_auroc = AUROC(task="binary")
+
+    def _freeze_encoder(self):
+        for p in self.encoder.parameters():
+            p.requires_grad = False
+        self.encoder.eval()
+
+    def _prepare_segmentation_labels(self, seg_labels):
+        """Robustly prepares segmentation labels to ensure shape (B, 1, H, W, D)."""
+        # If (B, C, H, W, D), select the first channel (as per user requirement)
+        if seg_labels.ndim == 5:
+             # Keep the channel dimension
+             seg_labels = seg_labels[:, 0:1, ...]
+
+        # Ensure channel dimension if input is (B, H, W, D)
+        if seg_labels.ndim == 4:
+             seg_labels = seg_labels.unsqueeze(1)
+        
+        return seg_labels
+
+    def forward(self, x):
+        # x shape: (B, C, H, W, D)
+        B, C = x.shape[0], x.shape[1]
+        # Reshape (B, C, H, W, D) -> (B*C, 1, H, W, D)
+        x_reshaped = x.view(B * C, 1, *x.shape[2:])
+
+        # ------------------------------------------------------
+        # A. Shared Feature Extraction (Frozen)
+        # ------------------------------------------------------
+        self.encoder.eval() 
+        with torch.no_grad():
+            # Each map has shape [B*C, Dim, H', W', D']
+            all_features = self.encoder.swinViT(x_reshaped) 
+
+        # ------------------------------------------------------
+        # B. Segmentation Path (Trainable, DWI only - Channel 0)
+        # ------------------------------------------------------
+        # Isolate DWI features
+        dwi_features = []
+        for features in all_features:
+            f_shape = features.shape
+            # 1. Unstack: [B*C, Dim, ...] -> [B, C, Dim, ...]
+            f_reshaped = features.view(B, C, f_shape[1], *f_shape[2:])
+            # 2. Select DWI (Channel 0): [B, Dim, ...]
+            f_dwi = f_reshaped[:, 0, ...] 
+            dwi_features.append(f_dwi)
+
+        # Run the segmentation decoder
+        segmentation_logits, fused_seg_features = self.segmentation_decoder(dwi_features)
+
+        # Pool the segmentation features for fusion
+        pooled_seg_features = self.seg_pool(fused_seg_features) # [B, SegDim, 1, 1, 1]
+        pooled_seg_features = pooled_seg_features.view(B, -1)   # [B, SegDim]
+
+        # ------------------------------------------------------
+        # C. Classification Path (Trainable, ALL channels)
+        # ------------------------------------------------------
+        pooled_cls_features = []
+        for i, features in enumerate(all_features):
+            # Process the B*C features
+            pooled = self.pools[i](features)           # [B*C, dim, 1, 1, 1]
+            pooled = pooled.view(B * C, -1)            # [B*C, dim]
+            projected = self.cls_projections[i](pooled) # [B*C, ClsDim] 
+            pooled_cls_features.append(projected)
+
+        # Concatenate scales and reshape
+        multi_scale = torch.cat(pooled_cls_features, dim=1)      # [B*C, 5*ClsDim]
+        # Reshape back to batch dimension B
+        multi_scale = multi_scale.view(B, C * 5 * self.common_dim_cls) # [B, C*5*ClsDim]
+
+        # ------------------------------------------------------
+        # D. FUSION
+        # ------------------------------------------------------
+        # Combine the multi-modal features and the segmentation features
+        combined_features = torch.cat([multi_scale, pooled_seg_features], dim=1)
+
+        # Classify
+        classification_logits = self.classifier_head(combined_features)
+        
+        return classification_logits.squeeze(-1), segmentation_logits
+
+
+    def training_step(self, batch, batch_idx):
+        images, cls_labels_raw, seg_labels_raw = batch['image'], batch['reg_label'].float(), batch["label"].float()
+        
+        cls_logits, seg_logits = self(images)
+
+        # 1. Classification Loss (BCE)
+        cls_labels = cls_labels_raw.view(-1).to(cls_logits.device)
+        loss_cls = F.binary_cross_entropy_with_logits(cls_logits, cls_labels)
+
+        # 2. Segmentation Loss (DiceCE)
+        seg_labels = self._prepare_segmentation_labels(seg_labels_raw).to(seg_logits.device)
+             
+        # Handle potential size mismatches if dataloader output != img_size
+        if seg_logits.shape[2:] != seg_labels.shape[2:]:
+            seg_logits = F.interpolate(seg_logits, size=seg_labels.shape[2:], mode='trilinear', align_corners=False)
+
+        loss_seg = self.seg_loss_fn(seg_logits, seg_labels)
+
+        # 3. Total Loss (MTL): L_total = L_cls + lambda * L_seg
+        loss = loss_cls + self.hparams.lambda_seg * loss_seg
+
+        self.log('train/loss_total', loss, prog_bar=True)
+        self.log('train/loss_cls', loss_cls)
+        self.log('train/loss_seg', loss_seg, prog_bar=True)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        images, cls_labels_raw = batch['image'], batch['reg_label'].float()
+        
+        cls_logits, seg_logits = self(images)
+        cls_labels = cls_labels_raw.view(-1).to(cls_logits.device)
+
+        loss_cls = F.binary_cross_entropy_with_logits(cls_logits, cls_labels)
+        loss = loss_cls
+        
+        # Check if masks are available for auxiliary loss and visualization
+        has_masks = "label" in batch and batch["label"] is not None
+        
+        if has_masks:
+            seg_labels_raw = batch["label"].float().to(seg_logits.device)
+            seg_labels = self._prepare_segmentation_labels(seg_labels_raw)
+                
+            # Handle potential size mismatches
+            if seg_logits.shape[2:] != seg_labels.shape[2:]:
+                seg_logits_resized = F.interpolate(seg_logits, size=seg_labels.shape[2:], mode='trilinear', align_corners=False)
+            else:
+                seg_logits_resized = seg_logits
+
+            loss_seg = self.seg_loss_fn(seg_logits_resized, seg_labels)
+            # Include auxiliary loss in total validation loss
+            loss += self.hparams.lambda_seg * loss_seg
+            self.log('val/loss_seg', loss_seg, on_epoch=True)
+
+        # Primary Assessment Metric: AUROC
+        probs = torch.sigmoid(cls_logits)
+        self.val_acc.update(probs, cls_labels)
+        self.val_auroc.update(probs, cls_labels)
+        self.log_dict({'val/loss': loss, 'val_acc': self.val_acc, 'val_auroc': self.val_auroc}, on_epoch=True, prog_bar=True)
+
+        # --- [NEW] 2. Visualization (Only on the first batch if masks are available) ---
+        # We visualize during the step to avoid storing outputs across the epoch.
+        if batch_idx == 0 and has_masks:
+            # We use the resized logits for visualization as they match the GT mask shape
+            self._log_validation_images(batch, seg_logits, batch_idx)
+
+    # [NEW] 1. Predict step implementation
+    def predict_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0) -> Dict[str, torch.Tensor]:
+        """
+        Performs prediction on a batch.
+        Returns classification probabilities (primary task) and segmentation logits.
+        """
+        # Check if 'image' key exists, otherwise assume the batch itself is the image tensor
+        if isinstance(batch, dict) and 'image' in batch:
+            images = batch['image']
+        else:
+            images = batch
+
+        # Run the forward pass
+        cls_logits, seg_logits = self(images)
+        # Calculate probabilities for the classification task
+        cls_probs = torch.sigmoid(cls_logits)
+        
+        # Return both outputs
+        return {
+            "classification_probs": cls_probs,
+            "segmentation_logits": seg_logits
+        }
+
+
+    def configure_optimizers(self):
+        # Ensure all trainable parts are included (Encoder is frozen).
+        # We simply filter parameters that require gradients.
+        trainable_params = [p for p in self.parameters() if p.requires_grad]
+
+        optimizer = torch.optim.AdamW(
+            trainable_params,
+            lr=self.hparams.learning_rate,
+            weight_decay=self.hparams.weight_decay
+        )
+
+        # Scheduler
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=50, T_mult=2, eta_min=1e-7
+        )
+
+        return {
+            'optimizer': optimizer,
+            'lr_scheduler': {
+                'scheduler': scheduler,
+                'interval': 'epoch',
+                'frequency': 1
+            }
+        }
+
+    # Keep the loading mechanism exactly the same (as requested)
+    @classmethod
+    def load_from_pretrained(
+        cls,
+        checkpoint_path: str,
+        num_classes: int, # Kept for compatibility with original request
+        in_channels: int,
+        **kwargs
+    ):
+        """
+        Loads only the SwinViT backbone weights from a ContrastiveTransformer checkpoint.
+        """
+        # Load pretrained ContrastiveTransformer (Requires definition of ContrastiveTransformer)
+        try:
+            # Assuming ContrastiveTransformer is defined elsewhere
+            pretrain_model = ContrastiveTransformer.load_from_checkpoint(checkpoint_path)
+        except NameError:
+            print("Error: ContrastiveTransformer class not defined. Cannot load pretrained model.")
+            raise
+        except Exception as e:
+            print(f"Error loading checkpoint from {checkpoint_path}: {e}")
+            raise
+
+        # Handle potential mismatch in hparams structure
+        if hasattr(pretrain_model, 'hparams') and pretrain_model.hparams:
+             # Convert to dict if it's a Namespace or similar object
+             finetuner_hparams = dict(pretrain_model.hparams)
+        else:
+             print("Warning: Pretrained model does not have 'hparams'. Using kwargs only.")
+             finetuner_hparams = {}
+
+        finetuner_hparams.update(kwargs)
+        finetuner_hparams['in_channels'] = in_channels
+
+        # Create finetuner with fresh weights (decoder/heads will be randomly initialized)
+        model = cls(**finetuner_hparams)
+
+        # --- Extract just swinViT weights ---
+        # Assuming the backbone is located at encoder.swinViT
+        try:
+            src_dict = pretrain_model.encoder.swinViT.state_dict()
+        except AttributeError:
+            print("Error: Could not find 'encoder.swinViT' in the pretrained model structure.")
+            raise
+            
+        dst_dict = model.encoder.swinViT.state_dict()
+
+        # Keep only matching keys with identical shape
+        filtered = {k: v for k, v in src_dict.items() if k in dst_dict and v.shape == dst_dict[k].shape}
+
+        # Load into finetuner backbone
+        msg = model.encoder.swinViT.load_state_dict(filtered, strict=False)
+
+        print(f"\n✓ Loaded {len(filtered)} swinViT tensors from {checkpoint_path}")
+        print(f"    Missing keys: {len(msg.missing_keys)} | Unexpected keys: {len(msg.unexpected_keys)}\n")
+        
+        # Ensure the encoder remains frozen after loading
+        model._freeze_encoder()
+
+        return model
+
+    
+    def _log_validation_images(self, batch, outputs, batch_idx):
+        # Visualization logic (adapted from the original SegmentationFineTuner)
+        if batch_idx > 0 or not hasattr(self, 'trainer') or self.trainer.global_rank != 0: return
+        if not self.logger or not self.logger.experiment or wandb is None: return
+        
+        label = batch['label'][0, 0, :, :, :].cpu().numpy()
+        img = batch['image'][0].cpu().numpy()
+        pred = (torch.sigmoid(outputs[0]) > 0.5).squeeze(0).cpu().numpy()
+        
+        # Use the first modality for visualization background
+        vis_img = img[0] 
+
+        # Find slices with the most foreground voxels
+        slice_idx_z = np.argmax(np.sum(label, axis=(1, 2)))
+        slice_idx_y = np.argmax(np.sum(label, axis=(0, 2)))
+        slice_idx_x = np.argmax(np.sum(label, axis=(0, 1)))
+
+        # If no foreground exists, use the center slice
+        if np.sum(label) == 0:
+            slice_idx_z, slice_idx_y, slice_idx_x = [s // 2 for s in vis_img.shape]
+
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        
+        views = [
+            ("Axial", vis_img[slice_idx_z, :, :], label[slice_idx_z, :, :], pred[slice_idx_z, :, :]),
+            ("Coronal", vis_img[:, slice_idx_y, :], label[:, slice_idx_y, :], pred[:, slice_idx_y, :]),
+            ("Sagittal", vis_img[:, :, slice_idx_x], label[:, :, slice_idx_x], pred[:, :, slice_idx_x]),
+        ]
+        
+        for i, (title, img_slice, lbl_slice, pred_slice) in enumerate(views):
+            axes[i].imshow(np.rot90(img_slice), cmap="gray")
+            # Plot ground truth contour (Yellow)
+            if np.any(lbl_slice): axes[i].contour(np.rot90(lbl_slice), colors='yellow', linewidths=0.8, alpha=0.9)
+            # Plot prediction contour (Red)
+            if np.any(pred_slice): axes[i].contour(np.rot90(pred_slice), colors='red', linewidths=0.8, alpha=0.9)
+            axes[i].set_title(title); axes[i].axis('off')
+            
+        self.logger.experiment.log({"Validation/Prediction vs Label": wandb.Image(fig)})
+        plt.close(fig)
+
 
 if __name__ == "__main__":
     model = ClassificationFineTuner.load_from_checkpoint(

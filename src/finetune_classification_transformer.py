@@ -13,11 +13,11 @@ from yucca.modules.data.augmentation.YuccaAugmentationComposer import (
     YuccaAugmentationComposer,
 )
 from yucca.pipeline.configuration.split_data import get_split_config
-from mato_models.models import ClassificationFineTuner, RegressionFineTuner, SegmentationFineTuner, ClassificationFinetuner2, RegressionFinetuner2, RegressionFinetuner3,  SegmentationProtoNet, RegressionFinetuner4
+from mato_models.models import ClassificationFineTuner, RegressionFineTuner, SegmentationFineTuner, ClassificationFinetuner2, RegressionFinetuner2, RegressionFinetuner3,  SegmentationProtoNet, RegressionFinetuner4, ClassificationFinetunerMTL
 from yucca.modules.data.data_modules.YuccaDataModule import YuccaDataModule
 from yucca.modules.callbacks.loggers import YuccaLogger
 from yucca.modules.data.datasets.YuccaDataset import YuccaTrainDataset
-from data.dataset import FOMODataset
+from data.dataset import FOMODataset, FOMODatasetWithSeg
 
 
 from collections import Counter
@@ -436,9 +436,16 @@ def train(
         path_config=path_config,
     )
 
+    if task_type == "segmentation":
+        dataset = YuccaTrainDataset
+    elif task_type == 'regression':
+        dataset = FOMODataset
+    elif task_type == 'classification':
+        dataset = FOMODatasetWithSeg
+
     data_module = YuccaDataModule(
         train_dataset_class=(
-            YuccaTrainDataset if task_type == "segmentation" else FOMODataset
+            dataset
         ),
         composed_train_transforms=augmenter.train_transforms,
         composed_val_transforms=augmenter.val_transforms,
@@ -480,13 +487,24 @@ def train(
         #     learning_rate=1e-4,
         #     max_epochs=50,
         # )
-        model = ClassificationFinetuner2.load_from_pretrained(
+        # model = ClassificationFinetuner2.load_from_pretrained(
+        #     checkpoint_path=str(model_checkpoint),
+        #     num_classes=1,
+        #     in_channels=num_modalities,
+        #     freeze_encoder=False,
+        #     learning_rate=1e-4, # We discussed using a lower LR for fine-tuning
+        #     max_epochs=50
+        # )
+        model = ClassificationFinetunerMTL.load_from_pretrained(
             checkpoint_path=str(model_checkpoint),
-            num_classes=1,
-            in_channels=num_modalities,
-            freeze_encoder=False,
-            learning_rate=1e-4, # We discussed using a lower LR for fine-tuning
-            max_epochs=50
+            img_size=(96, 96, 96),
+            num_classes=2,
+            in_channels=4,
+            feature_size=24,
+            backbone_lr=2e-5,
+            head_lr=2e-4,
+            cls_loss_weight=1.0,
+            seg_loss_weight=0.5
         )
     elif task_type == "regression":
         # model = RegressionFinetuner2.load_from_checkpoint(
@@ -514,9 +532,11 @@ def train(
             str(model_checkpoint),
             num_classes=2,
             in_channels=3,
+            feature_size=24,
             freeze_encoder=True,
             learning_rate=1e-4,
             max_epochs=50,
+            out_channels=2,
         )
 
     trainer = pl.Trainer(

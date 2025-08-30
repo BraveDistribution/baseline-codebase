@@ -31,6 +31,8 @@ python src/finetune_hierarchical.py \
     --local_checkpoint /home/mg873uh/Projects_kb/baseline-codebase/_scripts/26_8.ckpt \
     --global_checkpoint /home/mg873uh/Projects_kb/baseline-codebase/_models/models/FOMO60k_2.667mm_float16/unet_b_lw_dec/versions/version_0/last.ckpt \
     --augmentation_preset basic \
+    --use_balanced_dataset \
+    --split_param 0.001 \
     --train_batches_per_epoch 100 \
     --patch_size 96 \
     --epochs 500 \

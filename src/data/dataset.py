@@ -101,7 +101,7 @@ class FOMODataset(Dataset):
             vol = np.load(file, allow_pickle=True)
 
         return vol
-    
+
     @property
     def labels(self):
         """
@@ -110,14 +110,123 @@ class FOMODataset(Dataset):
         """
         if not hasattr(self, '_labels_cache'):
             print("Caching all labels for weighted sampler... (this may take a moment the first time)")
-            
+
             # This is the loop that reads every .txt file to get the labels
             self._labels_cache = [self._load_label(case) for case in self.all_files]
-            
+
             # For regression, _load_label returns a numpy array, so we extract the number
             if self.task_type == 'regression':
                 self._labels_cache = [label.item() for label in self._labels_cache]
-                
+
+        return self._labels_cache
+
+
+class FOMODatasetWithSeg(Dataset):
+    """
+    Dataset class for FOMO downstream tasks. Supports classification and regression tasks.
+    For segmentation tasks, use YuccaTrainDataset from the Yucca library instead.
+    """
+
+    def __init__(
+        self,
+        samples: list,
+        patch_size: Tuple[int, int, int],
+        composed_transforms: Optional[torchvision.transforms.Compose] = None,
+        task_type: Literal["classification", "regression"] = "classification",
+        allow_missing_modalities: Optional[bool] = False,  # For compatibility
+        p_oversample_foreground: Optional[float] = None,  # For compatibility
+    ):
+        super().__init__()
+        # Support only non-segmentation tasks
+        assert task_type in [
+            "classification",
+            "regression",
+        ], f"Unsupported task type: {task_type}. For segmentation use YuccaTrainDataset instead."
+
+        self.task_type = task_type
+        self.all_files = samples
+        self.composed_transforms = composed_transforms
+        self.patch_size = patch_size
+
+        self.croppad = CropPad(patch_size=self.patch_size)
+        self.to_torch = NumpyToTorch()
+
+    def __len__(self):
+        return len(self.all_files)
+
+    def __getitem__(self, idx):
+        case = self.all_files[idx]
+
+        # single modality
+        assert isinstance(case, str)
+
+        data = self._load_volume(case)
+        label = self._load_label(case)
+        label_seg = self._load_label_seg(case)
+        data_dict = {
+            "file_path": case,
+            "image": data,
+            "label": label_seg,
+            "reg_label": label
+        }
+        metadata = {"foreground_locations": []}
+        transformer_data = self._transform(data_dict, metadata)
+        return transformer_data
+
+    def _transform(self, data_dict, metadata=None):
+        # Pad the image and label to ensure the entire volume is included
+        reg_label = data_dict["reg_label"]
+        del data_dict["reg_label"]
+        data_dict = self.croppad(data_dict, metadata)
+        if self.composed_transforms is not None:
+            data_dict = self.composed_transforms(data_dict)
+        data_dict["reg_label"] = reg_label
+        if data_dict["label"] is None: 
+            data_dict["label"] = np.zeros_like(data_dict["image"])
+        return self.to_torch(data_dict)
+
+    def _load_label(self, file):
+        # For classification and regression, labels are in .txt files
+        txt_file = file + ".txt"
+        if self.task_type == "classification":
+            return np.loadtxt(txt_file, dtype=int)
+        else:  # regression
+            reg_label = np.loadtxt(txt_file, dtype=float)
+            reg_label = np.atleast_1d(reg_label)
+            return reg_label
+    
+    def _load_label_seg(self, file): 
+        seg_file = file + "_label.npy"
+        if os.path.exists(seg_file):
+            return np.load(seg_file, "r")
+        else:
+            return None
+    
+    def _load_volume(self, file):
+        file = file + ".npy"
+        try:
+            vol = np.load(file, "r")
+        except ValueError:
+            vol = np.load(file, allow_pickle=True)
+
+        return vol
+
+    @property
+    def labels(self):
+        """
+        Returns a cached list of all labels in the dataset.
+        This will iterate through all files and load the labels once.
+        """
+        if not hasattr(self, '_labels_cache'):
+            print("Caching all labels for weighted sampler... (this may take a moment the first time)")
+
+            # This is the loop that reads every .txt file to get the labels
+            self._labels_cache = [self._load_label(case) for case in self.all_files]
+
+            # For regression, _load_label returns a numpy array, so we extract the number
+            if self.task_type == 'regression':
+                self._labels_cache = [label.item() for label in self._labels_cache]
+
         return self._labels_cache
 
 class HierarchicalDataset(Dataset):
@@ -287,6 +396,372 @@ class HierarchicalDataset(Dataset):
             vol = np.load(file_path, allow_pickle=True)
 
         return vol
+
+
+class HierarchicalAgeBalancedDataset(Dataset):
+    """
+    Balanced version of HierarchicalDataset for age regression tasks.
+    Implements binning and oversampling strategies to create more balanced
+    age distributions for few-shot learning scenarios.
+    """
+
+    def __init__(
+        self,
+        samples: list,
+        patch_size: Tuple[int, int, int],
+        local_data_dir: str = "/home/mg873uh/Projects_kb/data/finetuning_preproc/",
+        global_data_dir: str = "/home/mg873uh/Projects_kb/data/finetuning_preproc/Unified_2.6667mm_float16",
+        composed_transforms: Optional[torchvision.transforms.Compose] = None,
+        task_type: Literal["classification", "regression"] = "regression",
+        allow_missing_modalities: Optional[bool] = False,  # For compatibility
+        p_oversample_foreground: Optional[float] = None,  # For compatibility
+        # Balancing parameters
+        n_bins: int = 8,  # Number of age bins for balancing
+        oversample_factor: float = 1.0,  # Factor to multiply minority bins
+        balancing_strategy: Literal["oversample", "undersample", "hybrid"] = "oversample",
+        age_range: Tuple[float, float] = (20.0, 100.0),  # Expected age range
+        verbose: bool = True,
+    ):
+        super().__init__()
+        # Support only regression tasks for age balancing
+        assert task_type == "regression", f"HierarchicalAgeBalancedDataset only supports regression, got {task_type}"
+
+        self.task_type = task_type
+        self.original_samples = samples
+        self.composed_transforms = composed_transforms
+        self.patch_size = patch_size
+        self.local_data_dir = local_data_dir
+        self.global_data_dir = global_data_dir
+
+        # Balancing parameters
+        self.n_bins = n_bins
+        self.oversample_factor = oversample_factor
+        self.balancing_strategy = balancing_strategy
+        self.age_range = age_range
+        self.verbose = verbose
+
+        # Detect if this is validation dataset by checking sample count
+        # Validation datasets are typically much smaller than training datasets
+        self.is_validation = len(samples) < 100  # Heuristic: < 100 samples likely validation
+
+        if self.verbose:
+            dataset_type = "validation" if self.is_validation else "training"
+            print(f"🔍 Detected {dataset_type} dataset with {len(samples)} samples")
+
+        # Extract task name and validate pivot directory
+        self._validate_and_extract_task_info()
+
+        # Create balanced sample list only for training data
+        if self.is_validation:
+            if self.verbose:
+                print("📊 Validation dataset: Using original samples (no balancing)")
+            self.samples = self.original_samples
+        else:
+            if self.verbose:
+                print("🔄 Training dataset: Applying age balancing")
+            self._create_balanced_samples()
+
+        self.croppad = CropPad(patch_size=self.patch_size)
+        self.to_torch = NumpyToTorch()
+
+    def _validate_and_extract_task_info(self):
+        """
+        Extract task name from samples and validate that the pivot directory
+        matches either local_data_dir or global_data_dir.
+        """
+        if not self.original_samples:
+            raise ValueError("No samples provided to HierarchicalAgeBalancedDataset")
+
+        # Get the first sample to extract task info
+        first_sample = self.original_samples[0]
+
+        # Extract directory parts - samples come as full paths from YuccaDataModule
+        # e.g., '/home/mg873uh/Projects_kb/data/finetuning_preproc/Task001_FOMO1/FOMO1_sub_1'
+        sample_dir = os.path.dirname(first_sample)
+
+        # Find task name pattern (Task###_FOMO#)
+        parts = sample_dir.split(os.sep)
+        task_name = None
+        for part in parts:
+            if part.startswith('Task') and 'FOMO' in part:
+                task_name = part
+                break
+
+        if task_name is None:
+            raise ValueError(f"Could not extract task name from sample path: {first_sample}")
+
+        # Extract pivot directory by removing task name from sample directory
+        task_idx = parts.index(task_name)
+        pivot_parts = parts[:task_idx]
+        pivot_dir = os.sep.join(pivot_parts)
+
+        # Normalize paths for comparison
+        pivot_dir = os.path.normpath(pivot_dir)
+        local_data_dir = os.path.normpath(self.local_data_dir)
+        global_data_dir = os.path.normpath(self.global_data_dir)
+
+        # Check if pivot_dir matches either local_data_dir or global_data_dir
+        if pivot_dir != local_data_dir and pivot_dir != global_data_dir:
+            raise ValueError(
+                f"Pivot directory '{pivot_dir}' does not match either "
+                f"local_data_dir '{local_data_dir}' or global_data_dir '{global_data_dir}'"
+            )
+
+        self.task_name = task_name
+        self.pivot_dir = pivot_dir
+
+    def _load_all_labels(self):
+        """Load all labels to analyze distribution"""
+        labels = []
+        for sample in self.original_samples:
+            case = os.path.basename(sample)
+            label = self._load_label(case, self.local_data_dir)
+            # Convert to scalar if it's an array
+            if isinstance(label, np.ndarray):
+                label = label.item()
+            labels.append(label)
+        return np.array(labels)
+
+    def _create_age_bins(self, labels):
+        """Create age bins for balancing"""
+        min_age, max_age = self.age_range
+
+        # Create bin edges
+        bin_edges = np.linspace(min_age, max_age, self.n_bins + 1)
+
+        # Assign each label to a bin
+        bin_indices = np.digitize(labels, bin_edges) - 1
+
+        # Handle edge cases (values outside range)
+        bin_indices = np.clip(bin_indices, 0, self.n_bins - 1)
+
+        return bin_indices, bin_edges
+
+    def _create_balanced_samples(self):
+        """Create balanced sample list using binning and oversampling"""
+        if self.verbose:
+            print("Creating balanced age distribution...")
+
+        # Load all labels
+        all_labels = self._load_all_labels()
+
+        if self.verbose:
+            print(f"Original dataset: {len(all_labels)} samples")
+            print(f"Age range: {all_labels.min():.1f} - {all_labels.max():.1f}")
+            print(f"Mean age: {all_labels.mean():.1f} ± {all_labels.std():.1f}")
+
+        # Create age bins
+        bin_indices, bin_edges = self._create_age_bins(all_labels)
+
+        # Count samples per bin
+        bin_counts = np.bincount(bin_indices, minlength=self.n_bins)
+
+        if self.verbose:
+            print("\nOriginal distribution by age bins:")
+            for i, (count, edge_low, edge_high) in enumerate(zip(bin_counts, bin_edges[:-1], bin_edges[1:])):
+                print(f"  Bin {i} [{edge_low:.1f}-{edge_high:.1f}): {count} samples")
+
+        # Determine target count per bin based on strategy
+        if self.balancing_strategy == "oversample":
+            target_count = int(bin_counts.max() * self.oversample_factor)
+        elif self.balancing_strategy == "undersample":
+            target_count = bin_counts.min()
+        else:  # hybrid
+            target_count = int(np.median(bin_counts) * self.oversample_factor)
+
+        if self.verbose:
+            print(f"\nTarget samples per bin: {target_count}")
+
+        # Create balanced sample list
+        self.balanced_samples = []
+        self.sample_weights = []  # For potential weighted sampling
+
+        for bin_idx in range(self.n_bins):
+            # Get samples in this bin
+            bin_mask = bin_indices == bin_idx
+            bin_samples = [self.original_samples[i] for i in np.where(bin_mask)[0]]
+
+            if len(bin_samples) == 0:
+                continue
+
+            if self.balancing_strategy == "undersample":
+                # Randomly subsample to target count
+                if len(bin_samples) > target_count:
+                    selected_samples = np.random.choice(bin_samples, target_count, replace=False)
+                else:
+                    selected_samples = bin_samples
+            else:  # oversample or hybrid
+                # Oversample to target count
+                if len(bin_samples) < target_count:
+                    # Oversample with replacement
+                    selected_samples = np.random.choice(bin_samples, target_count, replace=True)
+                else:
+                    selected_samples = bin_samples
+
+            self.balanced_samples.extend(selected_samples)
+
+            # Track weights for each sample (inverse of original bin frequency)
+            weight = 1.0 / max(bin_counts[bin_idx], 1)
+            self.sample_weights.extend([weight] * len(selected_samples))
+
+        # Convert to list and shuffle
+        self.balanced_samples = list(self.balanced_samples)
+        self.sample_weights = np.array(self.sample_weights)
+
+        # Shuffle while maintaining correspondence
+        indices = np.random.permutation(len(self.balanced_samples))
+        self.balanced_samples = [self.balanced_samples[i] for i in indices]
+        self.sample_weights = self.sample_weights[indices]
+
+        if self.verbose:
+            print(f"\nBalanced dataset: {len(self.balanced_samples)} samples")
+
+            # Analyze new distribution
+            balanced_labels = []
+            for sample in self.balanced_samples:
+                case = os.path.basename(sample)
+                label = self._load_label(case, self.local_data_dir)
+                if isinstance(label, np.ndarray):
+                    label = label.item()
+                balanced_labels.append(label)
+
+            balanced_labels = np.array(balanced_labels)
+            balanced_bin_indices, _ = self._create_age_bins(balanced_labels)
+            balanced_bin_counts = np.bincount(balanced_bin_indices, minlength=self.n_bins)
+
+            print("\nBalanced distribution by age bins:")
+            for i, (count, edge_low, edge_high) in enumerate(zip(balanced_bin_counts, bin_edges[:-1], bin_edges[1:])):
+                print(f"  Bin {i} [{edge_low:.1f}-{edge_high:.1f}): {count} samples")
+
+            print(f"New mean age: {balanced_labels.mean():.1f} ± {balanced_labels.std():.1f}")
+
+    def __len__(self):
+        if self.is_validation:
+            return len(self.samples)  # Use original samples for validation
+        return len(self.balanced_samples)
+
+    def __getitem__(self, idx):
+        # Use appropriate sample list based on dataset type
+        if self.is_validation:
+            case_full_path = self.samples[idx]  # Use original samples for validation
+        else:
+            case_full_path = self.balanced_samples[idx]  # Use balanced samples for training
+
+        # single modality
+        assert isinstance(case_full_path, str)
+
+        # Extract just the basename for the case (e.g., 'FOMO1_sub_1' from full path)
+        case = os.path.basename(case_full_path)
+
+        # Load both local (high-res) and global (low-res) data
+        local_data = self._load_volume(case, self.local_data_dir)
+        global_data = self._load_volume(case, self.global_data_dir)
+        label = self._load_label(case, self.local_data_dir)  # Labels from local dir
+
+        # Create separate data dictionaries for local and global
+        local_data_dict = {
+            "file_path": case_full_path,  # Keep full path for debugging
+            "image": local_data,
+            "label": label,
+        }
+
+        global_data_dict = {
+            "file_path": case_full_path,  # Keep full path for debugging
+            "image": global_data,
+            "label": label,
+        }
+
+        metadata = {"foreground_locations": []}
+
+        # Transform both local and global data with the same transforms
+        local_transformed = self._transform(local_data_dict, metadata)
+        global_transformed = self._transform(global_data_dict, metadata)
+
+        # Prepare sample weight (only for training datasets)
+        if self.is_validation:
+            sample_weight = 1.0  # Default weight for validation
+        else:
+            sample_weight = self.sample_weights[idx]
+
+        # Return dictionary with both local and global views
+        return {
+            "local": local_transformed["image"],
+            "global": global_transformed["image"],
+            "label": label,
+            "file_path": case_full_path,  # Keep full path for debugging
+            "sample_weight": sample_weight,  # For potential weighted loss
+        }
+
+    def _transform(self, data_dict, metadata=None):
+        # Pad the image and label to ensure the entire volume is included
+        label = data_dict["label"]
+        data_dict["label"] = None
+        data_dict = self.croppad(data_dict, metadata)
+
+        if self.composed_transforms is not None:
+            data_dict = self.composed_transforms(data_dict)
+
+        data_dict["label"] = label
+
+        return self.to_torch(data_dict)
+
+    def _load_volume_and_header(self, file, data_dir):
+        vol = self._load_volume(file, data_dir)
+        header_path = os.path.join(data_dir, self.task_name, file + ".pkl")
+        header = load_pickle(header_path)
+        return vol, header
+
+    def _load_label(self, file, data_dir):
+        # For regression, labels are in .txt files
+        txt_file = os.path.join(data_dir, self.task_name, file + ".txt")
+        reg_label = np.loadtxt(txt_file, dtype=float)
+        reg_label = np.atleast_1d(reg_label)
+        return reg_label
+
+    def _load_volume(self, file, data_dir):
+        # Construct the full path: data_dir/task_name/file.npy
+        file_path = os.path.join(data_dir, self.task_name, file + ".npy")
+
+        try:
+            vol = np.load(file_path, "r")
+        except ValueError:
+            vol = np.load(file_path, allow_pickle=True)
+
+        return vol
+
+    def get_sample_weights(self):
+        """
+        Return sample weights for potential use in weighted loss functions.
+        Returns None for validation datasets to prevent biasing validation.
+        """
+        if self.is_validation:
+            return None  # No weights for validation to keep it unbiased
+        return self.sample_weights
+
+    def get_distribution_stats(self):
+        """Return statistics about the balanced distribution"""
+        balanced_labels = []
+        for sample in self.balanced_samples:
+            case = os.path.basename(sample)
+            label = self._load_label(case, self.local_data_dir)
+            if isinstance(label, np.ndarray):
+                label = label.item()
+            balanced_labels.append(label)
+
+        balanced_labels = np.array(balanced_labels)
+        bin_indices, bin_edges = self._create_age_bins(balanced_labels)
+        bin_counts = np.bincount(bin_indices, minlength=self.n_bins)
+
+        return {
+            'labels': balanced_labels,
+            'bin_edges': bin_edges,
+            'bin_counts': bin_counts,
+            'mean_age': balanced_labels.mean(),
+            'std_age': balanced_labels.std(),
+            'min_age': balanced_labels.min(),
+            'max_age': balanced_labels.max()
+        }
+
 
 class PretrainDataset(Dataset):
     def __init__(

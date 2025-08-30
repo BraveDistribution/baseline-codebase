@@ -59,6 +59,48 @@ class ComboLoss(nn.Module):
         return self.alpha*self.robust(y_hat, y) + self.beta*self.corr(y_hat, y) + (1-self.alpha-self.beta)*self.ccc(y_hat, y)
 
 
+class WeightedComboLoss(nn.Module):
+    """
+    Weighted version of ComboLoss that handles sample weights from HierarchicalAgeBalancedDataset.
+    Uses inverse frequency weights to balance training but keeps validation unbiased.
+    """
+    def __init__(self, alpha=0.5, beta=0.5, delta=1.0):
+        super().__init__()
+        self.alpha, self.beta = alpha, beta
+        self.huber_loss = nn.SmoothL1Loss(beta=delta, reduction='none')  # No reduction for per-sample weighting
+        self.corr = PearsonCorrLoss()
+        self.ccc = CCCLoss()
+
+    def forward(self, y_hat, y, sample_weights=None):
+        """
+        Forward pass with optional sample weighting.
+
+        Args:
+            y_hat: Predictions
+            y: True targets
+            sample_weights: Optional tensor of sample weights (from balanced dataset)
+                          If None, behaves like regular ComboLoss
+        """
+        if sample_weights is not None:
+            # Apply weighted Huber loss (per-sample weighting)
+            huber_losses = self.huber_loss(y_hat, y)
+            weighted_huber = (huber_losses * sample_weights).mean()
+
+            # For correlation losses, we still use the full batch for stability
+            # but could optionally weight these too if needed
+            corr_loss = self.corr(y_hat, y)
+            ccc_loss = self.ccc(y_hat, y)
+
+            return self.alpha * weighted_huber + self.beta * corr_loss + (1-self.alpha-self.beta) * ccc_loss
+        else:
+            # Standard unweighted loss (used for validation to avoid bias)
+            huber_loss = self.huber_loss(y_hat, y).mean()
+            corr_loss = self.corr(y_hat, y)
+            ccc_loss = self.ccc(y_hat, y)
+
+            return self.alpha * huber_loss + self.beta * corr_loss + (1-self.alpha-self.beta) * ccc_loss
+
+
 class ContrastiveTransformer(pl.LightningModule):
     def __init__(
         self,
@@ -366,6 +408,12 @@ class RegressionHierarchicalFinetuner(pl.LightningModule):
         combo_alpha: float = 0.5,  # Weight for Huber loss
         combo_beta: float = 0.3,   # Weight for Pearson correlation loss
         combo_delta: float = 1.0,  # Huber loss delta parameter
+        # Age balancing parameters for HierarchicalAgeBalancedDataset
+        use_balanced_dataset: bool = False,  # Whether to use balanced dataset for training
+        n_age_bins: int = 8,  # Number of age bins for balancing
+        balancing_strategy: str = "oversample",  # "oversample", "undersample", or "hybrid"
+        age_range: Tuple[float, float] = (20.0, 100.0),  # Expected age range
+        oversample_factor: float = 1.0,  # Factor to multiply minority bins
         **kwargs,
     ):
         super().__init__()
@@ -501,8 +549,8 @@ class RegressionHierarchicalFinetuner(pl.LightningModule):
 
         self.val_corr = PearsonCorrCoef()
 
-        # Initialize combo loss
-        self.combo_loss = ComboLoss(
+        # Initialize weighted combo loss (can handle both weighted and unweighted training)
+        self.combo_loss = WeightedComboLoss(
             alpha=self.hparams.combo_alpha,
             beta=self.hparams.combo_beta,
             delta=self.hparams.combo_delta
@@ -543,6 +591,8 @@ class RegressionHierarchicalFinetuner(pl.LightningModule):
     def load_from_global_pretrained(self, global_checkpoint: str):
         """
         Load pretrained weights for the global encoder from a checkpoint.
+        Applies the same shape filtering logic as BaseSupervisedModel to handle
+        input channel mismatches between pretrained and finetuning models.
 
         Args:
             global_checkpoint: Path to the global encoder checkpoint
@@ -552,6 +602,7 @@ class RegressionHierarchicalFinetuner(pl.LightningModule):
 
             # Import the utility function
             from utils.utils import load_pretrained_weights
+            import copy
 
             # Load checkpoint using the utility function
             # Note: We assume the global encoder is not compiled for now
@@ -571,9 +622,24 @@ class RegressionHierarchicalFinetuner(pl.LightningModule):
 
                 global_encoder_weights[clean_key] = value
 
-            # Load weights into global encoder (non-strict to handle architectural differences)
+            # Apply the same shape filtering logic as BaseSupervisedModel.load_state_dict
+            # This handles cases where input channels differ between pretrained and current model
+            old_params = copy.deepcopy(self.global_encoder.state_dict())
+            filtered_state_dict = {
+                k: v
+                for k, v in global_encoder_weights.items()
+                if (k in old_params) and (old_params[k].shape == v.shape)
+            }
+
+            rejected_keys_new = [k for k in global_encoder_weights.keys() if k not in old_params]
+            rejected_keys_shape = [
+                k for k in global_encoder_weights.keys()
+                if k in old_params and old_params[k].shape != global_encoder_weights[k].shape
+            ]
+
+            # Load filtered weights into global encoder
             load_result = self.global_encoder.load_state_dict(
-                global_encoder_weights, strict=False
+                filtered_state_dict, strict=False
             )
 
             # Handle different return types from load_state_dict
@@ -588,8 +654,26 @@ class RegressionHierarchicalFinetuner(pl.LightningModule):
                 # load_state_dict returned None - this is also valid in some cases
                 missing_keys, unexpected_keys = [], []
 
-            print(f"✓ Loaded global encoder weights from {global_checkpoint}")
+            # Count successful weight transfers (same logic as BaseSupervisedModel)
+            successful = 0
+            unsuccessful = 0
+            new_params = self.global_encoder.state_dict()
+            for param_name, p1, p2 in zip(
+                old_params.keys(), old_params.values(), new_params.values()
+            ):
+                # If more than one param in layer is NE (not equal) to the original weights we've successfully loaded new weights
+                if p1.data.ne(p2.data).sum() > 0:
+                    successful += 1
+                else:
+                    unsuccessful += 1
+
+            print(f"✓ Successfully transferred weights for {successful}/{successful+unsuccessful} layers")
+            print(f"  Loaded {len(filtered_state_dict)} compatible tensors from {global_checkpoint}")
             print(f"  Missing keys: {len(missing_keys)} | Unexpected keys: {len(unexpected_keys)}")
+            print(f"  Rejected keys (new): {len(rejected_keys_new)} | Rejected keys (shape): {len(rejected_keys_shape)}")
+
+            if rejected_keys_shape:
+                print(f"  Shape mismatches (expected for input channel differences): {rejected_keys_shape[:5]}")  # Show first 5
 
         except Exception as e:
             print(f"⚠️  Warning: Could not load global encoder weights from {global_checkpoint}")
@@ -789,29 +873,58 @@ class RegressionHierarchicalFinetuner(pl.LightningModule):
 
         return output.squeeze(-1) if not self.hparams.predict_uncertainty else output
 
-    def compute_loss(self, pred, target):
-        """Computes the combo loss (Huber + Pearson + CCC)."""
+    def compute_loss(self, pred, target, sample_weights=None):
+        """
+        Computes the weighted combo loss (Huber + Pearson + CCC).
+
+        Args:
+            pred: Model predictions
+            target: True targets
+            sample_weights: Optional sample weights from balanced dataset
+                          Only used during training, not validation
+        """
         if self.hparams.predict_uncertainty:
             pred = pred[:, 0]
-        return self.combo_loss(pred, target)
+        return self.combo_loss(pred, target, sample_weights)
 
     def training_step(self, batch, batch_idx):
         targets = batch['label'].float().view(-1)
 
+        # Extract sample weights if available (from HierarchicalAgeBalancedDataset)
+        sample_weights = None
+        if 'sample_weight' in batch and self.hparams.use_balanced_dataset:
+            sample_weights = batch['sample_weight'].float()
+
         # Keep unmixed copies for logging
         batch_for_logging = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
         targets_for_logging = targets.clone()
+        sample_weights_for_logging = sample_weights.clone() if sample_weights is not None else None
 
         # Normalize targets *before* MixUp
         targets_normalized = self._normalize(targets)
 
         # >>> MixUp here <<<
+        # Note: MixUp will also mix the sample weights appropriately
         batch, targets_normalized, lam = self._maybe_mixup(batch, targets_normalized)
 
-        preds = self(batch)
-        loss = self.compute_loss(preds, targets_normalized)
+        # Apply MixUp to sample weights if they exist
+        if sample_weights is not None:
+            # Get the mixed indices from the batch (assuming _maybe_mixup stores them)
+            # For now, we'll use the unmixed weights (more conservative approach)
+            sample_weights_mixed = sample_weights  # Could be enhanced to mix weights too
 
-        self.log('train/loss', loss, on_step=False, on_epoch=True, sync_dist=True)
+        preds = self(batch)
+
+        # Use sample weights only during training for age balancing
+        loss = self.compute_loss(preds, targets_normalized, sample_weights_mixed if sample_weights is not None else None)
+
+        # Log additional metrics about sample weights if used
+        log_dict = {'train/loss': loss}
+        if sample_weights is not None:
+            log_dict['train/avg_sample_weight'] = sample_weights.mean()
+            log_dict['train/sample_weight_std'] = sample_weights.std()
+
+        self.log_dict(log_dict, on_step=False, on_epoch=True, sync_dist=True)
 
         # Log visualization only once at epoch 0
         if self.current_epoch == 0 and not self.has_logged_train_batch:
@@ -837,7 +950,10 @@ class RegressionHierarchicalFinetuner(pl.LightningModule):
         preds = self(batch)
 
         targets_normalized = self._normalize(targets)
-        loss = self.compute_loss(preds, targets_normalized)
+
+        # CRITICAL: Never use sample weights for validation to keep it unbiased
+        # Always pass None for sample_weights to ensure fair evaluation
+        loss = self.compute_loss(preds, targets_normalized, sample_weights=None)
 
         preds_mean_normalized = preds[:, 0] if self.hparams.predict_uncertainty else preds
         preds_original = self._unnormalize(preds_mean_normalized.detach())

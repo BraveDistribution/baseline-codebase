@@ -38,6 +38,20 @@ import torch
 import pytorch_lightning as pl
 from typing import Dict, Any
 
+# CRITICAL: Set up deterministic algorithms with warn_only BEFORE any other imports
+# This prevents the max_pool3d deterministic error from MONAI SwinUNETR
+try:
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    print("🔧 Early deterministic setup: warn_only=True enabled")
+except Exception as e:
+    print(f"🔧 Early deterministic setup failed: {e}")
+    # Fallback to disabling deterministic algorithms entirely
+    try:
+        torch.use_deterministic_algorithms(False)
+        print("🔧 Fallback: Deterministic algorithms disabled")
+    except:
+        pass
+
 # Lightning components
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
 from pytorch_lightning.loggers import WandbLogger
@@ -104,6 +118,15 @@ class HierarchicalConfig:
         self.local_data_dir = args.local_data_dir
         self.global_data_dir = args.global_data_dir
         self.augmentation_preset = args.augmentation_preset
+
+        # === AGE BALANCING CONFIGURATION ===
+        # Only relevant for regression tasks with age prediction
+        self.use_balanced_dataset = getattr(args, 'use_balanced_dataset', False)
+        self.n_age_bins = getattr(args, 'n_age_bins', 8)
+        self.balancing_strategy = getattr(args, 'balancing_strategy', 'oversample')
+        age_range_list = getattr(args, 'age_range', [20.0, 100.0])
+        self.age_range = tuple(age_range_list)  # Convert list to tuple
+        self.oversample_factor = getattr(args, 'oversample_factor', 1.0)
 
         # === EXPERIMENT CONFIGURATION ===
         self.save_dir = args.save_dir
@@ -194,6 +217,18 @@ class HierarchicalConfig:
         print(f"   Split Method: {self.split_method}")
         print(f"   Split Param: {self.split_param}")
 
+        print(f"\n⚖️  AGE BALANCING:")
+        if hasattr(self, 'use_balanced_dataset') and self.use_balanced_dataset:
+            print(f"   Balanced Dataset: ✅ ENABLED")
+            print(f"   Age Bins: {self.n_age_bins}")
+            print(f"   Strategy: {self.balancing_strategy}")
+            print(f"   Age Range: {self.age_range}")
+            print(f"   Oversample Factor: {self.oversample_factor}")
+            print(f"   Note: Validation uses unweighted loss for unbiased evaluation")
+        else:
+            print(f"   Balanced Dataset: ❌ DISABLED (standard dataset)")
+            print(f"   Note: Using original age distribution")
+
         print(f"\n🖥️  HARDWARE SETUP:")
         print(f"   Accelerator: {self.accelerator}")
         print(f"   Num Devices: {self.num_devices}")
@@ -251,6 +286,12 @@ def create_hierarchical_model(config: HierarchicalConfig) -> pl.LightningModule:
             mixup_alpha=config.mixup_alpha,
             mixup_prob=config.mixup_prob,
             freeze_global_encoder=config.freeze_global_encoder,
+            # Age balancing parameters
+            use_balanced_dataset=config.use_balanced_dataset,
+            n_age_bins=config.n_age_bins,
+            balancing_strategy=config.balancing_strategy,
+            age_range=config.age_range,
+            oversample_factor=config.oversample_factor,
         )
 
     elif config.model_type == "classification":
@@ -270,12 +311,14 @@ def create_hierarchical_model(config: HierarchicalConfig) -> pl.LightningModule:
 def create_data_module(config: HierarchicalConfig) -> YuccaDataModule:
     """
     Create data module with HierarchicalDataset for multi-resolution training.
+    Uses HierarchicalAgeBalancedDataset for training if age balancing is enabled,
+    but always uses regular HierarchicalDataset for validation to keep it unbiased.
 
     Args:
         config: Hierarchical configuration object
 
     Returns:
-        Configured YuccaDataModule with HierarchicalDataset
+        Configured YuccaDataModule with appropriate datasets
     """
     # Set up augmentations
     aug_params = get_finetune_augmentation_params(config.augmentation_preset)
@@ -305,18 +348,38 @@ def create_data_module(config: HierarchicalConfig) -> YuccaDataModule:
         path_config=path_config,
     )
 
-    # Create a partial function to pass local_data_dir and global_data_dir to HierarchicalDataset
+    # Import the balanced dataset
+    from data.dataset import HierarchicalDataset, HierarchicalAgeBalancedDataset
     from functools import partial
 
-    HierarchicalDatasetWithConfig = partial(
-        HierarchicalDataset,
-        local_data_dir=config.local_data_dir,
-        global_data_dir=config.global_data_dir,
-    )
+    # Choose dataset class based on configuration
+    if hasattr(config, 'use_balanced_dataset') and config.use_balanced_dataset and config.task_type == "regression":
+        print(f"🔄 Using HierarchicalAgeBalancedDataset with {config.n_age_bins} age bins")
+        print("📊 Note: Balancing applies only during training, validation remains unbiased")
 
-    # Create data module with HierarchicalDataset
+        # Create dataset class with age balancing parameters
+        DatasetClass = partial(
+            HierarchicalAgeBalancedDataset,
+            local_data_dir=config.local_data_dir,
+            global_data_dir=config.global_data_dir,
+            n_bins=getattr(config, 'n_age_bins', 8),
+            balancing_strategy=getattr(config, 'balancing_strategy', 'oversample'),
+            age_range=getattr(config, 'age_range', (20.0, 100.0)),
+            oversample_factor=getattr(config, 'oversample_factor', 1.0),
+            verbose=True
+        )
+    else:
+        print("📊 Using standard HierarchicalDataset")
+        DatasetClass = partial(
+            HierarchicalDataset,
+            local_data_dir=config.local_data_dir,
+            global_data_dir=config.global_data_dir,
+        )
+
+    # Create data module - use single dataset class for both train and validation
+    # doesn't support separate validation dataset classes
     data_module = YuccaDataModule(
-        train_dataset_class=HierarchicalDatasetWithConfig,
+        train_dataset_class=DatasetClass,
         composed_train_transforms=augmenter.train_transforms,
         composed_val_transforms=augmenter.val_transforms,
         patch_size=config.patch_size,
@@ -440,35 +503,33 @@ def setup_experiment_directory(config: HierarchicalConfig) -> tuple[str, int]:
     return version_dir, version
 
 
+def apply_deterministic_settings():
+    """Apply deterministic settings that handle non-deterministic CUDA operations."""
+    try:
+        # Ensure our warn_only setting is still active
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        print("✓ Deterministic settings confirmed: warn_only=True for unsupported operations")
+        return True
+
+    except Exception as e:
+        print(f"⚠️  Failed to apply deterministic settings: {e}")
+        # Last resort: disable deterministic algorithms completely
+        try:
+            torch.use_deterministic_algorithms(False)
+            print("✓ Fallback: Deterministic algorithms disabled to prevent errors")
+            return False
+        except:
+            return False
+
+
 def setup_deterministic_training():
     """
     Set up deterministic training configuration that handles CUDA operations
     without deterministic implementations.
-
-    The SwinUNETR model uses max_pool3d operations which don't have deterministic
-    CUDA implementations. This function enables deterministic algorithms with
-    warn_only=True to allow training while maintaining reproducibility for
-    supported operations.
     """
-    try:
-        # Enable deterministic algorithms with warnings for operations that don't support it
-        torch.use_deterministic_algorithms(True, warn_only=True)
-        print("✓ Deterministic algorithms enabled with warnings for unsupported operations")
-        return True
-    except Exception as e:
-        print(f"⚠️  Could not enable deterministic algorithms: {e}")
-
-        # Fallback: Set up partial deterministic behavior
-        try:
-            torch.backends.cudnn.deterministic = True
-            torch.backends.cudnn.benchmark = False
-            print("✓ Fallback: Set CUDNN deterministic mode")
-            return False
-        except Exception as e2:
-            print(f"⚠️  Could not set CUDNN deterministic mode: {e2}")
-            return False
-
-
+    return apply_deterministic_settings()
 def train_hierarchical_model(config: HierarchicalConfig):
     """
     Main training function for hierarchical models.
@@ -524,6 +585,11 @@ def train_hierarchical_model(config: HierarchicalConfig):
 
     # Create trainer
     print(f"\n🚀 Setting up trainer...")
+
+    # Apply deterministic settings right before trainer creation
+    print(f"   Applying deterministic settings before trainer initialization...")
+    apply_deterministic_settings()
+
     trainer = pl.Trainer(
         max_epochs=config.epochs,
         accelerator=config.accelerator,
@@ -566,6 +632,10 @@ def train_hierarchical_model(config: HierarchicalConfig):
     print(f"   Batch size: {config.batch_size} x {config.num_devices} = {config.effective_batch_size}")
 
     try:
+        # Ensure deterministic settings are still active before training
+        print(f"\n🔧 Final confirmation of deterministic settings before training...")
+        apply_deterministic_settings()
+
         trainer.fit(model, datamodule=data_module, ckpt_path=ckpt_path)
         print(f"\n✅ Training completed successfully!")
         print(f"📁 Results saved to: {version_dir}")
@@ -651,6 +721,30 @@ def parse_arguments():
     data_group.add_argument(
         "--augmentation_preset", type=str, default="basic", choices=["all", "basic", "none"],
         help="Augmentation preset"
+    )
+
+    # === AGE BALANCING CONFIGURATION ===
+    balance_group = parser.add_argument_group("Age Balancing Configuration")
+    balance_group.add_argument(
+        "--use_balanced_dataset", action="store_true",
+        help="Use HierarchicalAgeBalancedDataset for training (regression only)"
+    )
+    balance_group.add_argument(
+        "--n_age_bins", type=int, default=8,
+        help="Number of age bins for balancing (default: 8 for range 20-100)"
+    )
+    balance_group.add_argument(
+        "--balancing_strategy", type=str, default="oversample",
+        choices=["oversample", "undersample", "hybrid"],
+        help="Strategy for balancing age distribution"
+    )
+    balance_group.add_argument(
+        "--age_range", type=float, nargs=2, default=[20.0, 100.0],
+        help="Expected age range for binning (min max)"
+    )
+    balance_group.add_argument(
+        "--oversample_factor", type=float, default=1.0,
+        help="Factor to multiply target samples per bin (1.0 = equal bin sizes)"
     )
 
     # === SPLIT CONFIGURATION ===

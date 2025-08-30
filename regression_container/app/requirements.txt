@@ -13,3 +13,5 @@ wandb>=0.16.0
 opencv-python>=4.8.0
 monai==1.5.0
 torchmetrics==1.4.0.post0
+matplotlib>=3.5.0
+peft==0.17.1
