@@ -1308,7 +1308,7 @@ predict_config = {
     # Import values from task_configs
     **task3_config,
     # Add inference-specific configs
-    "model_paths": [
+    "model_path": [
         "/app/weights/fold0.ckpt",
         "/app/weights/fold1.ckpt",
         "/app/weights/fold2.ckpt",

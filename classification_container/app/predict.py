@@ -23,6 +23,23 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from yucca.modules.data.augmentation.transforms.cropping_and_padding import CropPad
 
+from monai.data import TestTimeAugmentation
+from monai.transforms import Compose, RandFlipd, RandRotate90d, EnsureTyped
+
+from monai.transforms import (
+    RandAdjustContrastd,      # gamma
+    RandScaleIntensityd,      # multiplicative scale
+    RandShiftIntensityd,      # additive shift
+    RandStdShiftIntensityd,   # shift in units of image std
+    RandGaussianNoised,       # additive Gaussian noise
+    RandGaussianSmoothd,      # blur
+    RandGaussianSharpend,     # sharpen
+    RandBiasFieldd,           # MRI bias field
+    RandHistogramShiftd,      # nonlinear intensity warp
+)
+
+
+
 def generate_random_mask(
     x: torch.Tensor,
     mask_ratio: float,
@@ -591,7 +608,7 @@ def save_output_txt(number: float | int, output_path: str):
 def get_multi_crop(image):
     croppad = CropPad(patch_size=(96, 96, 96))
     crops = []
-    for _ in range(2):
+    for _ in range(5):
         out = croppad(
             packed_data_dict={"image": image},
             image_properties={"foreground_locations": []}
@@ -652,43 +669,40 @@ def predict_from_config(
     )
 
     x_np = case_preprocessed.squeeze(0).detach().numpy()
-    print(f"\nx_np shape: {np.shape(x_np)}")
 
-    # croppad = CropPad(patch_size=(96, 96, 96))
-    # out = croppad(
-    #     packed_data_dict={"image": x_np},
-    #     image_properties={"foreground_locations": []}
-    # )
-    # x_np = out["image"].astype(np.float32, copy=False)
-    # case_preprocessed = torch.from_numpy(np.ascontiguousarray(x_np)).unsqueeze(0)
+    crops  = get_multi_crop(x_np)
 
-
-    case_preprocessed = get_multi_crop(x_np)
-    print(f"\ncase_preprocessed shape: {case_preprocessed.shape}")
-
-    # Load the model checkpoint directly with Lightning
-
-
-    model = ClassificationFinetuner2.load_from_checkpoint(str(model_path))
-
-    # Set model to evaluation mode
-    model.eval()
-    # Get device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
-    case_preprocessed = case_preprocessed.to(device)
+    crops = crops.to(device)
+
+    all_preds = []
 
     # Run inference
     with torch.no_grad():
-        # Set up sliding window parameters
 
-        # Get prediction
-        predictions = model(case_preprocessed)
+        for ckpt in model_path:
+            # Load each model, eval, to(device)
+            model = ClassificationFinetuner2.load_from_checkpoint(str(ckpt))
+            model.eval().to(device)
+
+            preds = model(crops)              # shape (5,) or (5,1)
+            preds = preds.view(-1)            # (5,)
+            all_preds.append(preds.detach().to("cpu"))
+
+            # free memory before next checkpoint
+            del model
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+    all_preds = torch.cat(all_preds, dim=0)
+
+
+
 
     if reverse_preprocess:
         predictions_original, _ = reverse_preprocessing(
             crop_to_nonzero=crop_to_nonzero,
-            images=predictions,
+            images=all_preds,
             image_properties=case_properties,
             n_classes=num_classes,
             transpose_forward=[0, 1, 2],
@@ -697,8 +711,8 @@ def predict_from_config(
         print(f"-- Prediction shape: {predictions_original.shape}")
         return predictions_original, images[0].affine
     else:
-        print(f"-- Prediction shape: {predictions.shape}")
-        return predictions, None
+        print(f"-- Prediction shape: {all_preds}")
+        return all_preds, None
 
 task1_config = {
     "task_name": "Task001_FOMO1",
@@ -720,7 +734,13 @@ predict_config = {
     # Import values from task_configs
     **task1_config,
     # Add inference-specific configs
-    "model_path": "/app/weights/brano_checkpoint_classification_258.ckpt",  # Path to model (inside container!)
+    "model_path": [
+        "/app/weights/fold0.ckpt",
+        "/app/weights/fold1.ckpt",
+        "/app/weights/fold2.ckpt",
+        "/app/weights/fold3.ckpt",
+        "/app/weights/fold4.ckpt",
+    ],
     "patch_size": (96, 96, 96),  # Patch size for inference
 }
 
@@ -770,10 +790,10 @@ def main():
         predict_config=predict_config,
     )
 
-    # softmax output to get probability
     probabilities = sigmoid(predictions_original)
 
-    save_output_txt(float(probabilities.mean()), output_path)
+    save_output_txt(float(probabilities.mean().item()), output_path)
+
 
 
 if __name__ == "__main__":
