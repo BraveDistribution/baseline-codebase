@@ -70,3 +70,7 @@ data/*
 .ipynb_checkpoints
 .fomoenv
 yucca
+
+# checkpoints and containers
+*.ckpt
+*.sig
