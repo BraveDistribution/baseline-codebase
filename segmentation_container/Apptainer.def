@@ -17,7 +17,11 @@ From: pytorch/pytorch:2.6.0-cuda11.8-cudnn9-runtime
     # Copy your files (model, predict.py, requirements.txt, ...) to the container
     ./app/predict.py /app/predict.py
     ./app/requirements.txt /app/requirements.txt
-    ./app/weights/.ckpt /app/weights/.ckpt
+    ./app/weights/fold0.ckpt /app/weights/fold0.ckpt
+    ./app/weights/fold1.ckpt /app/weights/fold1.ckpt
+    ./app/weights/fold2.ckpt /app/weights/fold2.ckpt
+    ./app/weights/fold3.ckpt /app/weights/fold3.ckpt
+    ./app/weights/fold4.ckpt /app/weights/fold4.ckpt
 
 
 %post

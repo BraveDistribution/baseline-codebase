@@ -628,6 +628,15 @@ def dbg(name, x):
     else:
         print(f"{name}: {type(x)} -> {x}")
 
+def load_models(ckpt_paths: List[str], device: torch.device) -> List[pl.LightningModule]:
+    models = []
+    for p in ckpt_paths:
+        m = SegmentationFineTuner.load_from_checkpoint(str(p))
+        m.eval()
+        m.to(device)
+        models.append(m)
+    return models
+
 
 def predict_from_config(
     modality_paths: List[str],
@@ -679,19 +688,23 @@ def predict_from_config(
 
     # Load the model checkpoint directly with Lightning
 
-    model = SegmentationFineTuner.load_from_checkpoint(str(model_path))
-
-    # Set model to evaluation mode
-    model.eval()
-
-    # Get device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
+
+    ckpt_paths = predict_config.get("model_path", None)
+
+
+    models = load_models(ckpt_paths, device)
+
+
     case_preprocessed = case_preprocessed.to(device)
 
     # Run inference
     with torch.no_grad():
-        # Set up sliding window inferer
+
+        if case_preprocessed.dim() == 4:
+            case_preprocessed = case_preprocessed.unsqueeze(0)  # (1, C, D, H, W)
+
+
         inferer = SlidingWindowInferer(
             roi_size=patch_size,   # e.g. (96, 96, 96)
             sw_batch_size=1,
@@ -699,79 +712,17 @@ def predict_from_config(
             mode="gaussian",
         )
 
-        # Ensure model input is (1, C, D, H, W)
-        if case_preprocessed.dim() == 4:
-            case_preprocessed = case_preprocessed.unsqueeze(0)
+        prob_sum = None
+        for m in models:
+            logits = inferer(inputs=case_preprocessed, network=m)       # (1, num_classes, D, H, W)
+            probs  = torch.softmax(logits, dim=1)                       # (1, num_classes, D, H, W)
+            prob_sum = probs if prob_sum is None else (prob_sum + probs)
+            # (optional) free temps
+            del logits, probs
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        predictions = prob_sum / len(models)
 
-        # --- MONAI TTA expects per-item (C, D, H, W), not batched ---
-        tta_input = case_preprocessed.squeeze(0)  # -> (C, D, H, W)
-
-        dbg("tta_input (C,D,H,W)", tta_input)
-
-        tta_transform = Compose([
-            RandFlipd(keys="image", prob=0.5, spatial_axis=0),
-            RandFlipd(keys="image", prob=0.5, spatial_axis=1),
-            RandFlipd(keys="image", prob=0.5, spatial_axis=2),
-            RandRotate90d(keys="image", prob=0.5, max_k=3),
-            EnsureTyped(keys="image"),
-        ])
-
-        tta_transform_intensity = Compose([
-            # keep tensor/meta consistent for TTA & inversion bookkeeping
-            EnsureTyped(keys="image"),
-
-            # ---- intensity-only TTAs (each has its own prob) ----
-            RandAdjustContrastd(keys="image", prob=0.5, gamma=(0.7, 1.5)),
-            RandScaleIntensityd(keys="image", prob=0.5, factors=(0.9, 1.1)),
-            RandShiftIntensityd(keys="image", prob=0.5, offsets=(-0.05, 0.05)),
-            RandStdShiftIntensityd(keys="image", prob=0.5, factors=(-0.25, 0.25)),
-
-            RandGaussianNoised(keys="image", prob=0.5, mean=0.0, std=0.02),
-            RandGaussianSmoothd(keys="image", prob=0.3, sigma_x=(0.25, 1.25), sigma_y=(0.25, 1.25), sigma_z=(0.25, 1.25)),
-            RandGaussianSharpend(keys="image", prob=0.3, sigma1_x=(0.5, 1.0), sigma1_y=(0.5, 1.0), sigma1_z=(0.5, 1.0), sigma2_x=(0.0, 0.5), sigma2_y=(0.0, 0.5), sigma2_z=(0.0, 0.5), alpha=(10.0, 30.0),),
-        ])
-
-        # (optional) reproducibility
-        tta_transform_intensity.set_random_state(seed=123)
-
-        # Wrap the inferer+model; return softmax probabilities
-        def _infer_fn(x: torch.Tensor) -> torch.Tensor:
-            # x is (B, C, D, H, W)
-            logits = inferer(inputs=x, network=model)
-            return torch.softmax(logits, dim=1)  # (B, num_classes, D, H, W)
-
-        # TTA config (ensure num_examples % batch_size == 0)
-        tta_cfg = predict_config.get("tta", {"num_examples": 2, "batch_size": 2})
-        n_examples = int(tta_cfg.get("num_examples", 2))
-        tta_bs = int(tta_cfg.get("batch_size", 2))
-        if n_examples % tta_bs != 0:
-            for d in range(min(n_examples, tta_bs), 0, -1):
-                if n_examples % d == 0:
-                    tta_bs = d
-                    break  # guarantees divisibility
-
-        tta = TestTimeAugmentation(
-            transform=tta_transform_intensity,
-            batch_size=tta_bs,        # number of TTA realizations per loader batch
-            num_workers=0,
-            inferrer_fn=_infer_fn,
-            device=device,
-            image_key="image",
-            orig_key="image",         # invert using the original image's meta
-            output_device=device,
-            return_full_data=False    # set True to get full stack
-        )
-
-        # Build the input dict MONAI expects (per-item tensor)
-        data = {"image": tta_input}  # (C, D, H, W)
-
-        # Run TTA: returns (mode, mean, std, vvc); use mean probs
-        mode_pred, mean_pred, std_pred, vvc = tta(data, num_examples=n_examples)
-        dbg("mean_pred (from TTA)", mean_pred)
-
-        # Add batch dim back for downstream (B, C, D, H, W)
-        predictions = mean_pred.unsqueeze(0)
-        dbg("predictions (after unsqueeze)", predictions)
 
     if reverse_preprocess:
         predictions_original, _ = reverse_preprocessing(
@@ -808,7 +759,13 @@ predict_config = {
     # Import values from task_configs
     **task2_config,
     # Add inference-specific configs
-    "model_path": "/app/weights/brano__segmentacia.ckpt",  # Path to model (inside container!)
+    "model_path": [
+        "/app/weights/fold0.ckpt",
+        "/app/weights/fold1.ckpt",
+        "/app/weights/fold2.ckpt",
+        "/app/weights/fold3.ckpt",
+        "/app/weights/fold4.ckpt",
+    ],  # Path to models (inside container!)
     "patch_size": (96, 96, 96),
 }
 
