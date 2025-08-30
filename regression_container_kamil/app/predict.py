@@ -2247,7 +2247,7 @@ def predict_from_config(
     if len(case_preprocessed.shape) == 5:
         case_img = case_preprocessed.squeeze(0).numpy()  # Remove batch dim: [channels, D, H, W]
     else:
-        case_img = case_preprocessed.numpy()  # Already [channels, D, H, W]
+        cas#e_img = case_preprocessed.numpy()  # Already [channels, D, H, W]
 
     for modality_idx in range(case_img.shape[0]):  # Iterate over modalities (T1, T2)
         modality_data = case_img[modality_idx]  # Extract single modality: [D, H, W]

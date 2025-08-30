@@ -2,7 +2,7 @@ from augmentations.finetune_augmentation_presets import get_finetune_augmentatio
 from data import datamodule
 import pytorch_lightning as pl
 
-from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.loggers import WandbLogger
 
 from pathlib import Path
@@ -94,11 +94,11 @@ class AgeBalancedWeights:
 class YuccaDataModuleWithBalancing(pl.LightningDataModule):
     """
     Extended YuccaDataModule with age-balanced sampling for regression tasks.
-    
+
     This module extends the standard YuccaDataModule to include age-balanced sampling
     when task_type is 'regression' and age balancing is enabled.
     """
-    
+
     def __init__(
         self,
         batch_size: int,
@@ -127,28 +127,28 @@ class YuccaDataModuleWithBalancing(pl.LightningDataModule):
         age_balance_config: Optional[dict] = None,
     ):
         super().__init__()
-        
+
         self.batch_size = batch_size
         self.patch_size = patch_size
         self.image_extension = image_extension
         self.task_type = task_type
-        
+
         self.split_idx = split_idx
         self.splits_config = splits_config
         self.train_data_dir = train_data_dir
-        
+
         self.allow_missing_modalities = allow_missing_modalities
         self.composed_train_transforms = composed_train_transforms
         self.composed_val_transforms = composed_val_transforms
         self.pre_aug_patch_size = pre_aug_patch_size
         self.p_oversample_foreground = p_oversample_foreground
-        
+
         # Prediction settings
         self.pred_include_cases = pred_include_cases
         self.overwrite_predictions = overwrite_predictions
         self.pred_data_dir = pred_data_dir
         self.pred_save_dir = pred_save_dir
-        
+
         # Age balancing settings
         self.use_age_balancing = use_age_balancing
         self.age_balance_config = age_balance_config or {
@@ -157,7 +157,7 @@ class YuccaDataModuleWithBalancing(pl.LightningDataModule):
             'temperature': 0.8,
             'visualize': False
         }
-        
+
         # Set default values
         self.num_workers = max(0, int(torch.get_num_threads() - 1)) if num_workers is None else num_workers
         self.val_num_workers = self.num_workers
@@ -165,30 +165,30 @@ class YuccaDataModuleWithBalancing(pl.LightningDataModule):
         self.train_sampler = train_sampler
         self.train_dataset_class = train_dataset_class
         self.val_sampler = val_sampler
-        
+
         logging.info(f"Using {self.num_workers} workers")
         logging.info(f"Using dataset class: {self.train_dataset_class} for train/val")
         if self.use_age_balancing and self.task_type == 'regression':
             logging.info(f"Age balancing enabled with config: {self.age_balance_config}")
-    
+
     def setup(self, stage: Literal["fit", "test", "predict"]):
         logging.info(f"Setting up data for stage: {stage}")
-        
+
         if stage == "fit":
             assert self.train_data_dir is not None
             assert self.split_idx is not None
             assert self.splits_config is not None
             assert self.task_type is not None
-            
+
             self.train_samples = [join(self.train_data_dir, i) for i in self.splits_config.train(self.split_idx)]
             self.val_samples = [join(self.train_data_dir, i) for i in self.splits_config.val(self.split_idx)]
-            
+
             if len(self.train_samples) < 100:
                 logging.info(f"Training on samples: {self.train_samples}")
-            
+
             if len(self.val_samples) < 100:
                 logging.info(f"Validating on samples: {self.val_samples}")
-            
+
             # Create training dataset
             self.train_dataset = self.train_dataset_class(
                 self.train_samples,
@@ -198,7 +198,7 @@ class YuccaDataModuleWithBalancing(pl.LightningDataModule):
                 allow_missing_modalities=self.allow_missing_modalities,
                 p_oversample_foreground=self.p_oversample_foreground,
             )
-            
+
             # Create validation dataset
             self.val_dataset = self.train_dataset_class(
                 self.val_samples,
@@ -208,18 +208,18 @@ class YuccaDataModuleWithBalancing(pl.LightningDataModule):
                 allow_missing_modalities=self.allow_missing_modalities,
                 p_oversample_foreground=self.p_oversample_foreground,
             )
-            
+
             # Visualize age distribution if requested
-            if (self.use_age_balancing and 
-                self.task_type == 'regression' and 
+            if (self.use_age_balancing and
+                self.task_type == 'regression' and
                 self.age_balance_config.get('visualize', False)):
                 self._visualize_age_distribution()
-        
+
         if stage == "predict":
             assert self.pred_data_dir is not None, "`pred_data_dir` is required in inference"
             assert self.pred_save_dir is not None, "`pred_save_dir` is required in inference"
             assert self.image_extension is not None, "`image_extension` is required in inference"
-            
+
             self.pred_dataset = self.test_dataset_class(
                 self.pred_data_dir,
                 pred_save_dir=self.pred_save_dir,
@@ -227,10 +227,10 @@ class YuccaDataModuleWithBalancing(pl.LightningDataModule):
                 suffix=self.image_extension,
                 pred_include_cases=self.pred_include_cases,
             )
-    
+
     def train_dataloader(self):
         logging.info(f"Starting training with data from: {self.train_data_dir}")
-        
+
         # Determine which sampler to use
         if self.use_age_balancing and self.task_type == 'regression':
             # Use age-balanced sampler for regression tasks
@@ -247,7 +247,7 @@ class YuccaDataModuleWithBalancing(pl.LightningDataModule):
             sampler = self.train_sampler(self.train_dataset)
         else:
             sampler = None
-        
+
         return DataLoader(
             self.train_dataset,
             num_workers=self.num_workers,
@@ -256,7 +256,7 @@ class YuccaDataModuleWithBalancing(pl.LightningDataModule):
             sampler=sampler,
             shuffle=sampler is None,
         )
-    
+
     def val_dataloader(self):
         # Validation typically doesn't need balancing
         sampler = self.val_sampler(self.val_dataset) if self.val_sampler is not None else None
@@ -267,48 +267,48 @@ class YuccaDataModuleWithBalancing(pl.LightningDataModule):
             pin_memory=torch.cuda.is_available(),
             sampler=sampler,
         )
-    
+
     def test_dataloader(self):
         return None
-    
+
     def predict_dataloader(self):
         logging.info("Starting inference")
         from functools import partial
         # Assuming single_case_collate is defined elsewhere
         single_case_collate = lambda x: x[0]  # Simple implementation
         return DataLoader(
-            self.pred_dataset, 
-            num_workers=self.num_workers, 
-            batch_size=1, 
+            self.pred_dataset,
+            num_workers=self.num_workers,
+            batch_size=1,
             collate_fn=single_case_collate
         )
-    
+
     def _visualize_age_distribution(self):
         """Visualize the age distribution in training data."""
         try:
             import matplotlib.pyplot as plt
-            
+
             if hasattr(self.train_dataset, 'labels'):
                 labels = self.train_dataset.labels
-                
+
                 plt.figure(figsize=(10, 4))
-                plt.hist(labels, bins=self.age_balance_config.get('num_bins', 15), 
+                plt.hist(labels, bins=self.age_balance_config.get('num_bins', 15),
                         alpha=0.7, color='blue', edgecolor='black')
                 plt.title('Training Set Age Distribution')
                 plt.xlabel('Age (years)')
                 plt.ylabel('Count')
                 plt.grid(True, alpha=0.3)
-                
+
                 # Add statistics
-                plt.axvline(np.mean(labels), color='red', linestyle='--', 
+                plt.axvline(np.mean(labels), color='red', linestyle='--',
                            label=f'Mean: {np.mean(labels):.1f}')
-                plt.axvline(np.median(labels), color='green', linestyle='--', 
+                plt.axvline(np.median(labels), color='green', linestyle='--',
                            label=f'Median: {np.median(labels):.1f}')
                 plt.legend()
-                
+
                 plt.tight_layout()
                 plt.show()
-                
+
                 logging.info(f"Age statistics - Min: {min(labels):.1f}, Max: {max(labels):.1f}, "
                            f"Mean: {np.mean(labels):.1f}, Median: {np.median(labels):.1f}")
         except ImportError:
@@ -321,7 +321,7 @@ def create_balanced_datamodule(config):
     Example function to create a balanced data module for brain age regression.
     """
     from yucca.data.data_module import YuccaDataModule  # Import original if needed
-    
+
     datamodule = YuccaDataModuleWithBalancing(
         batch_size=config['batch_size'],
         patch_size=config['patch_size'],
@@ -342,7 +342,7 @@ def create_balanced_datamodule(config):
             'visualize': True  # Show distribution on first run
         }
     )
-    
+
     return datamodule
 
 
@@ -418,6 +418,16 @@ def train(
         save_top_k=5,
         save_last=True,
     )
+
+    if task_type == "regression":
+        early_stopping = EarlyStopping(
+            monitor="val/mae",
+            mode="min",
+            patience=25,
+            verbose=True,
+            strict=False,  # Allow missing metrics during initial epochs
+        )
+
     # aug_params = get_finetune_augmentation_params("all")
     if aug_setup not in ['basic','all']:
         raise AttributeError("Invalid augmentation setup")
@@ -542,9 +552,13 @@ def train(
             out_channels=2,
         )
 
+    callbacks=[checkpoint_callback]
+    if task_type == "regression":
+        callbacks.append(early_stopping)
+
     trainer = pl.Trainer(
         max_epochs=num_epochs,
-        callbacks=[checkpoint_callback],
+        callbacks=callbacks,
         logger=[wandb_logger],
         accelerator="gpu",
         precision='16-mixed',

@@ -1363,11 +1363,10 @@ class ClassificationFinetuner2(pl.LightningModule):
             weight_decay=self.hparams.weight_decay
         )
 
-        # Restarts every 50 epochs, with increasing periods
         scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             optimizer,
-            T_0=50,  # First restart after 50 epochs
-            T_mult=2,  # Double the period after each restart (50, 100, 150)
+            T_0=50,
+            T_mult=2,
             eta_min=1e-7
         )
 
