@@ -1151,6 +1151,11 @@ def unnormalize(x: torch.Tensor, target_mean: float, target_std: float) -> torch
     """Reverses Z-score normalization."""
     return x * target_std + target_mean
 
+def unnormalizeV4(x: torch.Tensor, target_mean: float, target_std: float) -> torch.Tensor:
+    x_transformed = x * target_std + target_mean
+
+    return torch.expm1(x_transformed)
+
 def load_modalities(modality_paths: List[str]) -> List[nib.Nifti1Image]:
     """Load modality images from provided paths."""
     images = []
@@ -1178,7 +1183,7 @@ def save_output_txt(number: float | int, output_path: str):
 def get_multi_crop(image):
     croppad = CropPad(patch_size=(96, 96, 96))
     crops = []
-    for _ in range(10):
+    for _ in range(5):
         out = croppad(
             packed_data_dict={"image": image},
             image_properties={"foreground_locations": []}
@@ -1243,31 +1248,38 @@ def predict_from_config(
 
 
 
-    case_preprocessed = get_multi_crop(x_np)
+    crops  = get_multi_crop(x_np)
 
     # Load the model checkpoint directly with Lightning
 
     model = RegressionFinetuner4.load_from_checkpoint(str(model_path))
 
-    # Set model to evaluation mode
-    model.eval()
-
-    # Get device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
-    case_preprocessed = case_preprocessed.to(device)
+    crops = crops.to(device)
 
-    # Run inference
+    all_preds = []
+
     with torch.no_grad():
-        # Set up sliding window parameters
+        for ckpt in model_path:
+            # Load each model, eval, to(device)
+            model = RegressionFinetuner4.load_from_checkpoint(str(ckpt))
+            model.eval().to(device)
 
-        # Get prediction
-        predictions = model(case_preprocessed)
+            preds = model(crops)              # shape (5,) or (5,1)
+            preds = preds.view(-1)            # (5,)
+            all_preds.append(preds.detach().to("cpu"))
+
+            # free memory before next checkpoint
+            del model
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+    all_preds = torch.cat(all_preds, dim=0)
 
     if reverse_preprocess:
         predictions_original, _ = reverse_preprocessing(
             crop_to_nonzero=crop_to_nonzero,
-            images=predictions,
+            images=all_preds,
             image_properties=case_properties,
             n_classes=num_classes,
             transpose_forward=[0, 1, 2],
@@ -1276,8 +1288,8 @@ def predict_from_config(
         print(f"-- Prediction shape: {predictions_original.shape}")
         return predictions_original, images[0].affine
     else:
-        print(f"-- Prediction shape: {predictions.shape}")
-        return predictions, None
+        print(f"-- Prediction shape: {all_preds.shape}")
+        return all_preds, None
 
 task3_config = {
     "task_name": "Task003_FOMO3",
@@ -1294,19 +1306,18 @@ task3_config = {
     "target_orientation": "RAS",
 }
 
-# Task-specific hardcoded configuration
-# Determine if running in container or locally
-import os
-if os.path.exists("/app/weights/brano_29_8.ckpt"):
-    model_path = "/app/weights/brano_29_8.ckpt"  # Container path
-else:
-    model_path = "weights/brano_29_8.ckpt"  # Local relative path
 
 predict_config = {
     # Import values from task_configs
     **task3_config,
     # Add inference-specific configs
-    "model_path": model_path,
+    "model_paths": [
+        "/app/weights/fold0.ckpt",
+        "/app/weights/fold1.ckpt",
+        "/app/weights/fold2.ckpt",
+        "/app/weights/fold3.ckpt",
+        "/app/weights/fold4.ckpt",
+    ],
     "patch_size": (96, 96, 96),  # Patch size for inference
 }
 
@@ -1339,7 +1350,10 @@ def main():
         predict_config=predict_config,
     )
 
-    save_output_txt(int(unnormalize(predictions_original, target_mean=61.87, target_std=15.089118845634706).mean()), output_path)
+    ages = unnormalizeV4(predictions_original, target_mean=4.105172539442826, target_std=0.28682802940837737)
+
+    final_age = float(ages.mean().item())
+    save_output_txt(int(round(final_age)), output_path)
 
 
 if __name__ == "__main__":
