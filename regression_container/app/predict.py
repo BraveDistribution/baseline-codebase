@@ -1295,18 +1295,25 @@ task3_config = {
 }
 
 # Task-specific hardcoded configuration
+# Determine if running in container or locally
+import os
+if os.path.exists("/app/weights/brano_29_8.ckpt"):
+    model_path = "/app/weights/brano_29_8.ckpt"  # Container path
+else:
+    model_path = "weights/brano_29_8.ckpt"  # Local relative path
+
 predict_config = {
     # Import values from task_configs
     **task3_config,
     # Add inference-specific configs
-    "model_path": "/app/weights/brano_29_8.ckpt",  # Path to model (inside container!)
+    "model_path": model_path,
     "patch_size": (96, 96, 96),  # Patch size for inference
 }
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run inference on FOMO Task 1 (Infarct Detection)"
+        description="Run inference on FOMO Task 3 (Regression)"
     )
 
     # Input and output paths using modality names from task config

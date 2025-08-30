@@ -1,7 +1,9 @@
 _models
 models/
 models_supervised_transformer/
+src/inference/containers/evaluation_results/*
 *.ckpt
+regression_container_kamil/*
 *.sif
 
 # Byte-compiled / optimized / DLL files

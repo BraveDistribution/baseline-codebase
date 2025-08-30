@@ -157,7 +157,7 @@ def main():
     parser.add_argument(
         "--script_folder",
         type=str,
-        default="/home/mg873uh/Projects_kb/baseline-codebase/regression_container/app",
+        default="/home/mg873uh/Projects_kb/baseline-codebase/regression_container_kamil/app",
         help="Path to folder containing the inference script"
     )
 

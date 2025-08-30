@@ -2174,7 +2174,7 @@ def img_preprocess_for_global_branch(
     target_element_type: str = 'float16'
 )-> np.ndarray:
 
-    if not img_npy:
+    if img_npy is None or img_npy.size == 0:
         raise ValueError("Missing image to process.")
 
     if target_element_type not in ("float16", "float32", "float64"):
@@ -2194,7 +2194,6 @@ def img_preprocess_for_global_branch(
 
 
 def predict_from_config(
-    images: List[nib.Nifti1Image],
     modality_paths: List[str],
     predict_config: Dict[str, Any],
     reverse_preprocess: bool = False,
@@ -2242,17 +2241,24 @@ def predict_from_config(
     )
 
     global_enc_input:list[np.ndarray] = []
-    for img in case_preprocessed:
-        img_npy = img.numpy()
-        img_props = case_properties[img]
+
+    # case_preprocessed may have shape [batch_size, channels, D, H, W] or [channels, D, H, W]
+    # Squeeze only if we have 5 dimensions (batch dimension present)
+    if len(case_preprocessed.shape) == 5:
+        case_img = case_preprocessed.squeeze(0).numpy()  # Remove batch dim: [channels, D, H, W]
+    else:
+        case_img = case_preprocessed.numpy()  # Already [channels, D, H, W]
+
+    for modality_idx in range(case_img.shape[0]):  # Iterate over modalities (T1, T2)
+        modality_data = case_img[modality_idx]  # Extract single modality: [D, H, W]
 
         # Process each modality for the global branch
         processed_img = img_preprocess_for_global_branch(
-            img_npy,
-            img_props,
+            modality_data,
+            case_properties,
             target_spacing=2.6667,
             target_shape=(96, 96, 96),
-            target_element_type='float16'
+            target_element_type='float32'
         )
         global_enc_input.append(processed_img)
 
@@ -2268,11 +2274,11 @@ def predict_from_config(
 
     # Convert inputs to tensors and move to device
     case_preprocessed = case_preprocessed.to(device)
-    global_enc_input_tensor = torch.from_numpy(np.stack(global_enc_input, axis=1)).to(device)  # Stack along channel dimension
+    global_enc_input_tensor = torch.from_numpy(np.stack(global_enc_input, axis=0)).to(device)  # Stack along channel dimension
 
     # Create batch dictionary as expected by the model
     batch = {
-        'local': case_preprocessed.unsqueeze(0),  # Add batch dimension: (1, C, D, H, W)
+        'local': case_preprocessed,  # Add batch dimension: (1, C, D, H, W)
         'global': global_enc_input_tensor.unsqueeze(0)  # Add batch dimension: (1, C, D, H, W)
     }
 
@@ -2313,12 +2319,17 @@ task3_config = {
     "target_orientation": "RAS",
 }
 
-# Task-specific hardcoded configuration
+
+if os.path.exists("/app/weights/regression_hierarchical_v10.ckpt"):
+    model_path = "/app/weights/regression_hierarchical_v10.ckpt"  # Container path
+else:
+    model_path = "weights/regression_hierarchical_v10.ckpt"  # Local relative path
+
 predict_config = {
     # Import values from task_configs
     **task3_config,
     # Add inference-specific configs
-    "model_path": "/app/weights/brano_29_8.ckpt",  # Path to model (inside container!)
+    "model_path": model_path,
     "patch_size": (96, 96, 96),  # Patch size for inference
 }
 

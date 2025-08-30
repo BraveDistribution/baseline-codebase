@@ -2,21 +2,21 @@ FOMO Task3 Regression Evaluation Results
 ==================================================
 
 Dataset Statistics:
-  Total subjects/sessions: 200
-  Successful predictions: 200
+  Total subjects/sessions: 1
+  Successful predictions: 1
   Success rate: 1.000
 
 Ground Truth Age Statistics:
-  Mean ± Std: 61.9 ± 15.1
-  Range: [19.0, 89.0]
+  Mean ± Std: 30.0 ± 0.0
+  Range: [30.0, 30.0]
 
 Predicted Age Statistics:
-  Mean ± Std: 61.3 ± 14.3
-  Range: [16.0, 77.0]
+  Mean ± Std: 25.0 ± 0.0
+  Range: [25.0, 25.0]
 
 Evaluation Metrics:
-  Mean Absolute Error (MAE): 2.615 years
-  Root Mean Square Error (RMSE): 3.573 years
-  Pearson Correlation: 0.972 (p=5.40e-127)
-  Bias: -0.525 years
-  Standard Error: 3.534 years
+  Mean Absolute Error (MAE): 5.000 years
+  Root Mean Square Error (RMSE): 5.000 years
+  Pearson Correlation: nan (p=nan)
+  Bias: -5.000 years
+  Standard Error: 0.000 years
