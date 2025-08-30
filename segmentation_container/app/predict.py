@@ -36,6 +36,18 @@ from pathlib import Path
 from monai.data import TestTimeAugmentation
 from monai.transforms import Compose, RandFlipd, RandRotate90d, EnsureTyped
 
+from monai.transforms import (
+    RandAdjustContrastd,      # gamma
+    RandScaleIntensityd,      # multiplicative scale
+    RandShiftIntensityd,      # additive shift
+    RandStdShiftIntensityd,   # shift in units of image std
+    RandGaussianNoised,       # additive Gaussian noise
+    RandGaussianSmoothd,      # blur
+    RandGaussianSharpend,     # sharpen
+    RandBiasFieldd,           # MRI bias field
+    RandHistogramShiftd,      # nonlinear intensity warp
+)
+
 def generate_random_mask(
     x: torch.Tensor,
     mask_ratio: float,
@@ -703,8 +715,24 @@ def predict_from_config(
             RandRotate90d(keys="image", prob=0.5, max_k=3),
             EnsureTyped(keys="image"),
         ])
+
+        tta_transform_intensity = Compose([
+            # keep tensor/meta consistent for TTA & inversion bookkeeping
+            EnsureTyped(keys="image"),
+
+            # ---- intensity-only TTAs (each has its own prob) ----
+            RandAdjustContrastd(keys="image", prob=0.5, gamma=(0.7, 1.5)),
+            RandScaleIntensityd(keys="image", prob=0.5, factors=(0.9, 1.1)),
+            RandShiftIntensityd(keys="image", prob=0.5, offsets=(-0.05, 0.05)),
+            RandStdShiftIntensityd(keys="image", prob=0.5, factors=(-0.25, 0.25)),
+
+            RandGaussianNoised(keys="image", prob=0.5, mean=0.0, std=0.02),
+            RandGaussianSmoothd(keys="image", prob=0.3, sigma_x=(0.25, 1.25), sigma_y=(0.25, 1.25), sigma_z=(0.25, 1.25)),
+            RandGaussianSharpend(keys="image", prob=0.3, sigma1_x=(0.5, 1.0), sigma1_y=(0.5, 1.0), sigma1_z=(0.5, 1.0), sigma2_x=(0.0, 0.5), sigma2_y=(0.0, 0.5), sigma2_z=(0.0, 0.5), alpha=(10.0, 30.0),),
+        ])
+
         # (optional) reproducibility
-        tta_transform.set_random_state(seed=123)
+        tta_transform_intensity.set_random_state(seed=123)
 
         # Wrap the inferer+model; return softmax probabilities
         def _infer_fn(x: torch.Tensor) -> torch.Tensor:
@@ -713,8 +741,8 @@ def predict_from_config(
             return torch.softmax(logits, dim=1)  # (B, num_classes, D, H, W)
 
         # TTA config (ensure num_examples % batch_size == 0)
-        tta_cfg = predict_config.get("tta", {"num_examples": 8, "batch_size": 2})
-        n_examples = int(tta_cfg.get("num_examples", 8))
+        tta_cfg = predict_config.get("tta", {"num_examples": 2, "batch_size": 2})
+        n_examples = int(tta_cfg.get("num_examples", 2))
         tta_bs = int(tta_cfg.get("batch_size", 2))
         if n_examples % tta_bs != 0:
             for d in range(min(n_examples, tta_bs), 0, -1):
@@ -723,7 +751,7 @@ def predict_from_config(
                     break  # guarantees divisibility
 
         tta = TestTimeAugmentation(
-            transform=tta_transform,
+            transform=tta_transform_intensity,
             batch_size=tta_bs,        # number of TTA realizations per loader batch
             num_workers=0,
             inferrer_fn=_infer_fn,
