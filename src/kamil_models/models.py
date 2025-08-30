@@ -591,6 +591,8 @@ class RegressionHierarchicalFinetuner(pl.LightningModule):
     def load_from_global_pretrained(self, global_checkpoint: str):
         """
         Load pretrained weights for the global encoder from a checkpoint.
+        Applies the same shape filtering logic as BaseSupervisedModel to handle
+        input channel mismatches between pretrained and finetuning models.
 
         Args:
             global_checkpoint: Path to the global encoder checkpoint
@@ -600,6 +602,7 @@ class RegressionHierarchicalFinetuner(pl.LightningModule):
 
             # Import the utility function
             from utils.utils import load_pretrained_weights
+            import copy
 
             # Load checkpoint using the utility function
             # Note: We assume the global encoder is not compiled for now
@@ -619,9 +622,24 @@ class RegressionHierarchicalFinetuner(pl.LightningModule):
 
                 global_encoder_weights[clean_key] = value
 
-            # Load weights into global encoder (non-strict to handle architectural differences)
+            # Apply the same shape filtering logic as BaseSupervisedModel.load_state_dict
+            # This handles cases where input channels differ between pretrained and current model
+            old_params = copy.deepcopy(self.global_encoder.state_dict())
+            filtered_state_dict = {
+                k: v
+                for k, v in global_encoder_weights.items()
+                if (k in old_params) and (old_params[k].shape == v.shape)
+            }
+
+            rejected_keys_new = [k for k in global_encoder_weights.keys() if k not in old_params]
+            rejected_keys_shape = [
+                k for k in global_encoder_weights.keys()
+                if k in old_params and old_params[k].shape != global_encoder_weights[k].shape
+            ]
+
+            # Load filtered weights into global encoder
             load_result = self.global_encoder.load_state_dict(
-                global_encoder_weights, strict=False
+                filtered_state_dict, strict=False
             )
 
             # Handle different return types from load_state_dict
@@ -636,8 +654,26 @@ class RegressionHierarchicalFinetuner(pl.LightningModule):
                 # load_state_dict returned None - this is also valid in some cases
                 missing_keys, unexpected_keys = [], []
 
-            print(f"✓ Loaded global encoder weights from {global_checkpoint}")
+            # Count successful weight transfers (same logic as BaseSupervisedModel)
+            successful = 0
+            unsuccessful = 0
+            new_params = self.global_encoder.state_dict()
+            for param_name, p1, p2 in zip(
+                old_params.keys(), old_params.values(), new_params.values()
+            ):
+                # If more than one param in layer is NE (not equal) to the original weights we've successfully loaded new weights
+                if p1.data.ne(p2.data).sum() > 0:
+                    successful += 1
+                else:
+                    unsuccessful += 1
+
+            print(f"✓ Successfully transferred weights for {successful}/{successful+unsuccessful} layers")
+            print(f"  Loaded {len(filtered_state_dict)} compatible tensors from {global_checkpoint}")
             print(f"  Missing keys: {len(missing_keys)} | Unexpected keys: {len(unexpected_keys)}")
+            print(f"  Rejected keys (new): {len(rejected_keys_new)} | Rejected keys (shape): {len(rejected_keys_shape)}")
+
+            if rejected_keys_shape:
+                print(f"  Shape mismatches (expected for input channel differences): {rejected_keys_shape[:5]}")  # Show first 5
 
         except Exception as e:
             print(f"⚠️  Warning: Could not load global encoder weights from {global_checkpoint}")
